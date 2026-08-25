@@ -253,6 +253,78 @@ export function glowSprite(color = '#ffd08a', size = 128) {
   return tex;
 }
 
+// Diagonal hazard stripes for the emergency door frame.
+export function hazardStripes(size = 128) {
+  const { canvas, ctx } = makeCanvas(size);
+  ctx.fillStyle = '#d8b023';
+  ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = '#16161a';
+  ctx.lineWidth = size / 8;
+  ctx.beginPath();
+  for (let i = -size; i < size * 2; i += size / 4) {
+    ctx.moveTo(i, 0);
+    ctx.lineTo(i + size, size);
+  }
+  ctx.stroke();
+  grime(ctx, size, 61, 0.28, [0.3, 0.2, 0.05]);
+  return finish(canvas, 1);
+}
+
+// The lit EMERGENCY EXIT panel above the door.
+export function exitSign(size = 256) {
+  const { canvas, ctx } = makeCanvas(size);
+  ctx.fillStyle = '#0b1a10';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#0f2d1a';
+  ctx.fillRect(6, size * 0.28, size - 12, size * 0.44);
+
+  ctx.fillStyle = '#4dff88';
+  ctx.font = 'bold ' + Math.round(size * 0.15) + 'px ui-monospace, Menlo, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('EMERGENCY', size / 2, size * 0.41);
+  ctx.fillText('EXIT', size / 2, size * 0.59);
+
+  // Arrows either side, the way real signage carries them.
+  ctx.fillStyle = '#2f9c5a';
+  for (const dir of [-1, 1]) {
+    const cx = size / 2 + dir * size * 0.38;
+    ctx.beginPath();
+    ctx.moveTo(cx + dir * 14, size / 2);
+    ctx.lineTo(cx - dir * 8, size / 2 - 14);
+    ctx.lineTo(cx - dir * 8, size / 2 + 14);
+    ctx.closePath();
+    ctx.fill();
+  }
+  return finish(canvas, 1);
+}
+
+// A soft flame gradient, scrolled and scaled to fake fire cheaply.
+export function flameSprite(size = 128) {
+  const { canvas, ctx } = makeCanvas(size);
+  const g = ctx.createRadialGradient(size / 2, size * 0.68, 0, size / 2, size * 0.6, size * 0.5);
+  g.addColorStop(0, 'rgba(255,240,190,0.95)');
+  g.addColorStop(0.25, 'rgba(255,168,52,0.85)');
+  g.addColorStop(0.6, 'rgba(198,64,18,0.45)');
+  g.addColorStop(1, 'rgba(90,20,8,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  // Torn edges, so the billboards do not read as identical circles.
+  for (let i = 0; i < 30; i++) {
+    const a = hash2(i, 7, 31) * Math.PI * 2;
+    const r = size * (0.2 + hash2(i, 11, 31) * 0.28);
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.beginPath();
+    ctx.arc(size / 2 + Math.cos(a) * r, size * 0.6 + Math.sin(a) * r * 0.7,
+      size * 0.05 * hash2(i, 13, 31), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 // Monochrome static, animated by the film-grain overlay.
 export function noiseDataURL(size = 180) {
   const { canvas, ctx } = makeCanvas(size);

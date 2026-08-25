@@ -254,10 +254,14 @@ export class Hud {
     for (let i = 0; i < pips.length; i++) pips[i].classList.toggle('on', i < powered);
   }
 
-  setCarrying(carrying) {
-    if (carrying === this.lastCarrying) return;
-    this.lastCarrying = carrying;
-    this.el.carrying.hidden = !carrying;
+  // `kind` is null, 'fuse' or 'gas'.
+  setCarrying(kind) {
+    if (kind === this.lastCarrying) return;
+    this.lastCarrying = kind;
+    this.el.carrying.hidden = !kind;
+    if (!kind) return;
+    this.el.carrying.classList.toggle('gas', kind === 'gas');
+    this.el.carrying.lastChild.textContent = kind === 'gas' ? ' CARRYING GASOLINE' : ' CARRYING FUSE';
   }
 
   setPing(ms) {
@@ -378,15 +382,15 @@ export class Hud {
   }
 
   renderEnd(data) {
-    const won = data.outcome === 'escaped';
-    this.el.endTitle.textContent = won ? 'EXTRACTED' : 'NO SURVIVORS';
-    this.el.endTitle.className = 'screen-heading ' + (won ? 'won' : 'lost');
+    // Three outcomes: out through the door, out through the fire, or not out.
+    const ending = ENDINGS[data.outcome] || ENDINGS.lost;
     const escapedCount = data.players.filter((p) => p.escaped).length;
+
+    this.el.endTitle.textContent = ending.title;
+    this.el.endTitle.className = 'screen-heading ' + ending.tone;
     this.el.endSummary.innerHTML =
       `${data.powered} of ${data.need} fuses seated &middot; ${formatTime(data.time)} underground<br>` +
-      (won
-        ? `${escapedCount} of ${data.players.length} made it to the surface.`
-        : 'The facility kept everyone. It usually does.');
+      ending.body(escapedCount, data.players.length);
 
     this.el.endTable.innerHTML = data.players.map((p) => {
       const fate = p.escaped ? 'escaped' : p.state === 2 ? 'lost' : 'left behind';
@@ -399,6 +403,31 @@ export class Hud {
 
   setEndCountdown(seconds) { this.el.endCountdown.textContent = String(Math.max(0, seconds)); }
 }
+
+// Ending text, kept together and adjustable.
+const ENDINGS = {
+  escaped: {
+    title: 'ENDING 1 - ESCAPED',
+    tone: 'won',
+    body: (out, total) =>
+      `${out} of ${total} made it to the surface.<br>` +
+      'The facility is still standing behind you, and still humming.<br>' +
+      'But you are out.',
+  },
+  burned: {
+    title: 'ENDING 2 - BURNED',
+    tone: 'lost',
+    body: () =>
+      'You found another way out.<br>' +
+      'The generator took the building with it.<br>' +
+      'Whatever was down there is not coming up.',
+  },
+  lost: {
+    title: 'NO SURVIVORS',
+    tone: 'lost',
+    body: () => 'The facility kept everyone. It usually does.',
+  },
+};
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>

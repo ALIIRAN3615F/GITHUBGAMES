@@ -51,6 +51,7 @@ export class Input {
   constructor(canvas) {
     this.canvas = canvas;
     this.keys = new Set();
+    this.fresh = new Set();   // keys pressed since the last read
     this.mouseDX = 0;
     this.mouseDY = 0;
     this.locked = false;
@@ -63,10 +64,11 @@ export class Input {
       if (this.captureText) return;
       // Keep the browser from scrolling or tabbing away mid-run.
       if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+      if (!this.keys.has(e.code)) this.fresh.add(e.code);   // ignore auto-repeat
       this.keys.add(e.code);
     });
-    window.addEventListener('keyup', (e) => this.keys.delete(e.code));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('keyup', (e) => { this.keys.delete(e.code); this.fresh.delete(e.code); });
+    window.addEventListener('blur', () => { this.keys.clear(); this.fresh.clear(); });
 
     document.addEventListener('mousemove', (e) => {
       if (!this.locked) return;
@@ -87,7 +89,7 @@ export class Input {
       this.mouseDX = 0;
       this.mouseDY = 0;
       this.swallowNextMove = this.locked;
-      if (!this.locked) this.keys.clear();
+      if (!this.locked) { this.keys.clear(); this.fresh.clear(); }
       if (this.onLockChange) this.onLockChange(this.locked);
     });
   }
@@ -100,6 +102,14 @@ export class Input {
   }
 
   down(code) { return this.keys.has(code); }
+
+  // True once per physical press, so a key can toggle a state instead of
+  // holding it. Consumed on read.
+  pressed(code) {
+    if (!this.fresh.has(code)) return false;
+    this.fresh.delete(code);
+    return true;
+  }
 
   // Consume accumulated mouse movement for this frame.
   //
@@ -140,6 +150,7 @@ export class LocalPlayer {
     this.nerve = 0;              // 0 calm .. 1 panicking
     this.flashlightOn = true;
     this.crouching = false;
+    this.crouchToggled = false;
     this.sprinting = false;
     this.moving = false;
     this.busy = false;
@@ -220,7 +231,12 @@ export class LocalPlayer {
     const axis = canAct ? input.axis() : { x: 0, z: 0 };
 
     // --- Stance -------------------------------------------------------------
-    this.crouching = canAct && (input.down('ControlLeft') || input.down('ControlRight') || input.down('KeyC'));
+    // Ctrl is hold-to-crouch; C toggles, because staying hidden is a state you
+    // want to sit in rather than a key you want to keep held down.
+    const holdCrouch = input.down('ControlLeft') || input.down('ControlRight');
+    if (input.pressed('KeyC')) this.crouchToggled = !this.crouchToggled;
+    if (!canAct) this.crouchToggled = false;
+    this.crouching = canAct && (holdCrouch || this.crouchToggled);
     const wantsSprint = canAct && !this.crouching &&
       (input.down('ShiftLeft') || input.down('ShiftRight')) &&
       (axis.x !== 0 || axis.z !== 0) && this.stamina > STAMINA_MIN_TO_SPRINT;

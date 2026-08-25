@@ -137,6 +137,12 @@ html, body {
   color: var(--amber); display: flex; align-items: center; gap: 7px;
   text-shadow: 0 0 10px rgba(232,163,61,0.5);
 }
+#carrying.gas { color: #ff7b4a; text-shadow: 0 0 10px rgba(255, 123, 74, 0.5); }
+#carrying.gas .carry-icon {
+  background: #c0341f;
+  box-shadow: 0 0 10px rgba(192, 52, 31, 0.9);
+}
+
 .carry-icon {
   width: 9px; height: 14px; background: var(--amber); border-radius: 2px;
   box-shadow: 0 0 10px rgba(232,163,61,0.9);

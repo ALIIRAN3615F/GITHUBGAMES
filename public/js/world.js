@@ -9,6 +9,10 @@
 import * as THREE from '../vendor/three.module.js';
 import * as TEX from './textures.js';
 
+// How many flame billboards the fire effect uses at full spread. One instanced
+// mesh, so this is a vertex count question, not a draw-call one.
+const FIRE_BILLBOARDS = 44;
+
 const QUALITY = {
   low:    { shadows: false, shadowSize: 512,  lampLights: 0, propDetail: false, anisotropy: 1 },
   medium: { shadows: true,  shadowSize: 1024, lampLights: 2, propDetail: true,  anisotropy: 4 },
@@ -27,6 +31,9 @@ export class World {
     this.disposables = [];
     this.obstacles = [];
     this.obstacleBuckets = new Map();
+    this.fireMesh = null;
+    this.fireLights = [];
+    this.exitLocks = [];
     this.map = null;
     this.grid = null;
     this.powered = 0;
@@ -50,6 +57,7 @@ export class World {
     this.buildLamps();
     this.buildGenerator();
     this.buildExit();
+    this.buildFire();
   }
 
   makeMaterials() {
@@ -327,43 +335,185 @@ export class World {
     this.generatorGroup = group;
   }
 
-  // The exit: a blast door that stays shut and red until the power is on.
+  // The emergency exit. Deliberately not a door that happens to be open: it is
+  // a powered blast door with hazard striping, a lit sign and two lock bolts
+  // that read red or green from across the room, so its state is legible at a
+  // glance and at a distance.
   buildExit() {
     const e = this.map.exit;
     const group = new THREE.Group();
     group.position.set(e.x, 0, e.z);
 
+    // Heavy frame: jambs and a lintel, merged into one draw.
     const frame = mergeGeometries([
-      transformed(new THREE.BoxGeometry(0.3, 3.2, 0.5), -1.55, 1.6, 0),
-      transformed(new THREE.BoxGeometry(0.3, 3.2, 0.5), 1.55, 1.6, 0),
-      transformed(new THREE.BoxGeometry(3.4, 0.3, 0.5), 0, 3.05, 0),
+      transformed(new THREE.BoxGeometry(0.42, 3.4, 0.62), -1.62, 1.7, 0),
+      transformed(new THREE.BoxGeometry(0.42, 3.4, 0.62), 1.62, 1.7, 0),
+      transformed(new THREE.BoxGeometry(3.66, 0.42, 0.62), 0, 3.2, 0),
+      transformed(new THREE.BoxGeometry(3.66, 0.16, 0.7), 0, 0.08, 0),   // sill
     ]);
-    const frameMesh = new THREE.Mesh(frame, this.materials.metal);
-    group.add(frameMesh);
+    group.add(new THREE.Mesh(frame, this.materials.metal));
+    this.disposables.push(frame);
 
-    const door = new THREE.Mesh(new THREE.BoxGeometry(2.9, 3.0, 0.22), this.materials.rust);
-    door.position.y = 1.5;
+    // Hazard striping down both jambs.
+    const stripeTex = TEX.hazardStripes();
+    stripeTex.wrapS = stripeTex.wrapT = THREE.RepeatWrapping;
+    stripeTex.repeat.set(1, 4);
+    const stripeMat = new THREE.MeshStandardMaterial({ map: stripeTex, roughness: 0.8 });
+    const stripeGeo = new THREE.BoxGeometry(0.16, 3.0, 0.06);
+    for (const side of [-1, 1]) {
+      const s = new THREE.Mesh(stripeGeo, stripeMat);
+      s.position.set(side * 1.62, 1.6, 0.34);
+      group.add(s);
+    }
+    this.disposables.push(stripeTex, stripeGeo);
+
+    // The door leaf itself.
+    const door = new THREE.Mesh(new THREE.BoxGeometry(3.0, 3.05, 0.26), this.materials.rust);
+    door.position.y = 1.55;
     door.castShadow = this.quality.shadows;
     group.add(door);
     this.exitDoor = door;
 
+    // Reinforcing ribs, so it reads as heavy rather than as a slab.
+    const ribGeo = new THREE.BoxGeometry(2.8, 0.14, 0.32);
+    for (const y of [-1.0, 0, 1.0]) {
+      const rib = new THREE.Mesh(ribGeo, this.materials.metal);
+      rib.position.set(0, y, 0.02);
+      door.add(rib);
+    }
+    this.disposables.push(ribGeo);
+
+    // Lit EMERGENCY EXIT sign over the lintel.
+    const signTex = TEX.exitSign();
+    const sign = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.5, 0.5),
+      new THREE.MeshBasicMaterial({ map: signTex, transparent: false })
+    );
+    sign.position.set(0, 3.2, 0.34);
+    group.add(sign);
+    this.exitSign = sign;
+    this.disposables.push(signTex, sign.geometry);
+
+    // Two lock bolts. Red while the door is dead, green once it has power.
+    this.exitLocks = [];
+    const lockGeo = new THREE.BoxGeometry(0.3, 0.16, 0.14);
+    for (const side of [-1, 1]) {
+      const lock = new THREE.Mesh(lockGeo, new THREE.MeshBasicMaterial({ color: 0xff2a1a }));
+      lock.position.set(side * 1.35, 1.55, 0.3);
+      group.add(lock);
+      this.exitLocks.push(lock);
+    }
+    this.disposables.push(lockGeo);
+
+    // Conduit feeding the lock mechanism, so the power connection is visible.
+    const conduit = mergeGeometries([
+      transformed(new THREE.CylinderGeometry(0.06, 0.06, 2.6, 6), -1.9, 1.5, 0.2),
+      transformed(new THREE.CylinderGeometry(0.05, 0.05, 1.1, 6), 1.9, 2.2, 0.2),
+      transformed(new THREE.BoxGeometry(0.26, 0.34, 0.2), 1.9, 1.5, 0.2),   // junction box
+    ]);
+    group.add(new THREE.Mesh(conduit, this.materials.dark));
+    this.disposables.push(conduit);
+
     this.exitLight = new THREE.PointLight(0xff2a1a, 10, 13, 1.9);
-    this.exitLight.position.set(0, 2.6, 0.7);
+    this.exitLight.position.set(0, 2.6, 0.8);
     group.add(this.exitLight);
 
     const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshBasicMaterial({ color: 0xff2a1a }));
-    lamp.position.set(0, 3.05, 0.32);
+    lamp.position.set(0, 3.62, 0.2);
     group.add(lamp);
     this.exitLamp = lamp;
 
     this.root.add(group);
     this.exitGroup = group;
-    this.disposables.push(frame);
   }
+
+  // --- Fire (ending 2) ------------------------------------------------------
+
+  // Fire is a single instanced mesh of billboards sharing one additive
+  // material, plus two lights. No particle system, no light per flame: the
+  // whole effect is one extra draw call and two lights however far it spreads.
+  buildFire() {
+    const geo = new THREE.PlaneGeometry(1, 1);
+    const tex = TEX.flameSprite();
+    const mat = new THREE.MeshBasicMaterial({
+      map: tex, transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, opacity: 0.9,
+    });
+    const mesh = new THREE.InstancedMesh(geo, mat, FIRE_BILLBOARDS);
+    mesh.frustumCulled = false;
+    mesh.visible = false;
+    mesh.renderOrder = 2;
+    this.root.add(mesh);
+
+    this.fireMesh = mesh;
+    this.fireMatrix = new THREE.Matrix4();
+    this.fireSeeds = [];
+    for (let i = 0; i < FIRE_BILLBOARDS; i++) {
+      // Fixed polar offsets, so flames spread outward in a stable pattern
+      // rather than jittering around the room.
+      this.fireSeeds.push({
+        angle: (i * 2.39996) % (Math.PI * 2),      // golden angle: even scatter
+        radius: 0.6 + (i / FIRE_BILLBOARDS) * 11,
+        phase: (i * 0.7) % (Math.PI * 2),
+        scale: 0.9 + ((i * 37) % 10) / 12,
+      });
+    }
+
+    this.fireLights = [];
+    for (let i = 0; i < 2; i++) {
+      const light = new THREE.PointLight(0xff6a22, 0, 16, 1.7);
+      light.visible = false;
+      this.root.add(light);
+      this.fireLights.push(light);
+    }
+    this.disposables.push(geo, tex);
+  }
+
+  // `level` is 0..1: how far the fire has spread from the generator.
+  updateFire(dt, level, camera) {
+    if (!this.fireMesh) return;
+    const on = level > 0;
+    this.fireMesh.visible = on;
+    for (const l of this.fireLights) l.visible = on;
+    if (!on) return;
+
+    const gen = this.map.generator;
+    const count = Math.max(1, Math.round(level * FIRE_BILLBOARDS));
+    const m = this.fireMatrix;
+
+    for (let i = 0; i < FIRE_BILLBOARDS; i++) {
+      const s = this.fireSeeds[i];
+      if (i >= count) { m.makeScale(0, 0, 0); this.fireMesh.setMatrixAt(i, m); continue; }
+
+      const flicker = 0.75 + Math.sin(this.flickerPhase * 7 + s.phase) * 0.25;
+      const size = s.scale * (1.4 + flicker * 0.7);
+      const x = gen.x + Math.cos(s.angle) * s.radius;
+      const z = gen.z + Math.sin(s.angle) * s.radius;
+
+      // Billboard: yaw only, which is enough for ground fire and avoids a full
+      // lookAt per instance.
+      m.makeRotationY(camera ? Math.atan2(camera.position.x - x, camera.position.z - z) : 0);
+      m.scale(new THREE.Vector3(size, size * 1.25, size));
+      m.setPosition(x, size * 0.55 + Math.sin(this.flickerPhase * 3 + s.phase) * 0.1, z);
+      this.fireMesh.setMatrixAt(i, m);
+    }
+    this.fireMesh.instanceMatrix.needsUpdate = true;
+
+    // Two lights: one at the seat of the fire, one riding the leading edge.
+    const lead = Math.min(1, level) * 10;
+    this.fireLights[0].position.set(gen.x, 1.4, gen.z);
+    this.fireLights[0].intensity = 26 + Math.sin(this.flickerPhase * 9) * 10;
+    this.fireLights[1].position.set(
+      gen.x + Math.cos(this.flickerPhase * 0.4) * lead, 1.2,
+      gen.z + Math.sin(this.flickerPhase * 0.4) * lead
+    );
+    this.fireLights[1].intensity = 14 * level + Math.sin(this.flickerPhase * 11) * 5;
+  }
+
 
   // --- Per-frame -----------------------------------------------------------
 
-  update(dt, playerPos, powered, exitOpen, generatorOn) {
+  update(dt, playerPos, powered, exitOpen, generatorOn, fire = 0, camera = null) {
     this.flickerPhase += dt;
     const need = this.map ? this.map.fuseCount : 1;
     const ratio = need ? powered / need : 0;
@@ -381,18 +531,24 @@ export class World {
     }
 
     // Exit: the door lifts and the lamp turns when the power lands.
+    // The emergency door is an electrical lock: with no power it is shut and
+    // its bolts read red; with power the bolts throw green and it lifts.
     if (this.exitDoor) {
-      // The blast door stays open once it has been opened - cutting the power
-      // must not seal survivors in.
-      const target = exitOpen ? 4.4 : 1.5;
-      this.exitDoor.position.y += (target - this.exitDoor.position.y) * Math.min(1, dt * 0.9);
-      const c = exitOpen ? 0x3dff77 : 0xff2a1a;
+      const unlocked = !!exitOpen;
+      const target = unlocked ? 4.5 : 1.55;
+      this.exitDoor.position.y += (target - this.exitDoor.position.y) * Math.min(1, dt * 0.8);
+
+      const c = unlocked ? 0x3dff77 : 0xff2a1a;
       this.exitLight.color.setHex(c);
       this.exitLamp.material.color.setHex(c);
-      this.exitLight.intensity = exitOpen ? 24 + Math.sin(this.flickerPhase * 3) * 6 : 9;
+      this.exitLight.intensity = unlocked ? 22 + Math.sin(this.flickerPhase * 3) * 6 : 7;
+      for (const lock of this.exitLocks || []) lock.material.color.setHex(c);
+      // The sign only lights when the emergency circuit is live.
+      if (this.exitSign) this.exitSign.material.color.setScalar(unlocked ? 1 : 0.22);
     }
 
     this.updateLamps(dt, playerPos, ratio, generatorOn);
+    this.updateFire(dt, fire, camera);
   }
 
   // Lamps come on in step with the generator, and only the handful nearest the

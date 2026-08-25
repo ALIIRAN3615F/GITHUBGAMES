@@ -68,6 +68,10 @@ function generate(opts = {}) {
 
   const fuseCells = placeFuses(floors, distFromSpawn, w, maxDist, fuseCount, [spawnCell, genCell, exitCell], rng);
   const batteryCells = placeBatteries(floors, batteryCount, [spawnCell, genCell, exitCell, ...fuseCells], rng);
+  // A single fuel can, deliberately far from the entrance: the second ending
+  // should be something you stumble on while exploring, not trip over.
+  const gasCell = placeGasoline(floors, distFromSpawn, w, maxDist,
+    [spawnCell, genCell, exitCell, ...fuseCells, ...batteryCells], rng);
 
   // --- Dressing ------------------------------------------------------------
   const props = placeProps(grid, w, h, rooms, rng, [spawnCell, genCell, exitCell]);
@@ -92,6 +96,7 @@ function generate(opts = {}) {
     exit: worldPoint(exitCell, w, h),
     fuses: fuseCells.map((c, i) => ({ id: i, ...worldPoint(c, w, h) })),
     batteries: batteryCells.map((c, i) => ({ id: i, ...worldPoint(c, w, h) })),
+    gasoline: gasCell ? worldPoint(gasCell, w, h) : null,
     props,
     lamps,
     fuseCount,
@@ -261,6 +266,18 @@ function placeFuses(floors, dist, w, maxDist, count, avoid, rng) {
 // Batteries are the flashlight's ammunition, so they are spread far more
 // liberally than fuses: no distance requirement from the spawn, just enough
 // mutual spacing that they never cluster into one lucky pile.
+// The fuel can goes in the far half of the facility, well clear of anything
+// else worth walking to.
+function placeGasoline(floors, dist, w, maxDist, avoid, rng) {
+  const candidates = floors.filter((c) => {
+    const d = dist[idx(c.cx, c.cy, w)];
+    if (d < maxDist * 0.5) return false;
+    return !avoid.some((a) => Math.abs(a.cx - c.cx) + Math.abs(a.cy - c.cy) < 4);
+  });
+  if (!candidates.length) return null;
+  return rng.pick(candidates);
+}
+
 function placeBatteries(floors, count, avoid, rng) {
   const candidates = floors.filter((c) =>
     !avoid.some((a) => Math.abs(a.cx - c.cx) + Math.abs(a.cy - c.cy) < 2));

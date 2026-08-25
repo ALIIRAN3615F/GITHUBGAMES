@@ -26,8 +26,17 @@ const AMBIENT_LIT = 9;
 // here the picture is mush and the game stops being readable in the dark.
 const MIN_RENDER_SCALE = 0.55;
 
-const HOLD_TIME = { fuse: 0.9, insert: 1.9, revive: 3.6, exit: 1.4, battery: 0.4, power: 1.2 };
-const REACH = { fuse: 2.6, insert: 3.4, revive: 2.6, exit: 4.0, battery: 2.4, power: 3.6 };
+const HOLD_TIME = {
+  fuse: 0.9, insert: 1.9, revive: 3.6, exit: 1.4,
+  battery: 0.4, power: 1.2,
+  gas: 0.7,
+  // Pouring is deliberately the longest thing you can do, and the loudest.
+  pour: 3.2,
+};
+const REACH = {
+  fuse: 2.6, insert: 3.4, revive: 2.6, exit: 4.0,
+  battery: 2.4, power: 3.6, gas: 2.6, pour: 3.6,
+};
 
 class Game {
   constructor() {
@@ -310,7 +319,7 @@ class Game {
       this.hud.setHudVisible(true);
       this.hud.setFusePips(0, this.need);
       this.hud.setObjective('Find a fuse in the dark');
-      this.hud.setCarrying(false);
+      this.hud.setCarrying(null);
       this.hud.setDowned(false);
       this.hud.setDead(false);
       this.hud.setLoading(false);
@@ -368,6 +377,10 @@ class Game {
     this.powered = m.g;
     this.exitOpen = !!m.x;
     this.generatorOn = !!m.o;
+    this.sabotage = m.sb || null;
+    this.fire = m.fi || 0;
+    // The fuel can's holder is in the snapshot, so no extra player field.
+    this.carryingGas = !!(m.gs && m.gs[2] === 1 && m.gs[3] === this.localId);
     this.roundTime = m.tm;
 
     // Row: [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
@@ -422,9 +435,53 @@ class Game {
         if (fn && this.audio[fn]) this.audio[fn](ev.x, ev.z);
         break;
       }
-      case 'wake':
-        this.hud.banner('SOMETHING IS AWAKE', 'bad', 3.4);
-        this.audio.growl(ev.x, ev.z, 1.2);
+      case 'waking':
+        // The exploration phase is over, and you get told so.
+        this.hud.banner('SOMETHING IS STIRRING', 'bad', 4);
+        this.hud.addSystem('Somewhere below you, something just woke up.');
+        this.audio.growl(ev.x, ev.z, 1.3);
+        break;
+      case 'awake':
+        this.hud.banner('IT IS HUNTING NOW', 'bad', 3.4);
+        this.audio.scream(ev.x, ev.z);
+        break;
+      case 'lost':
+        // Only meaningful to whoever was being chased; kept quiet on purpose.
+        break;
+      case 'gas-taken':
+        this.hud.addSystem(`${ev.by} picked up the gasoline.`);
+        if (ev.id === this.localId) {
+          this.hud.banner('GASOLINE', '', 2.4);
+          this.hud.addSystem('Heavy. There is another way out of here.');
+        }
+        break;
+      case 'gas-dropped':
+        this.hud.addSystem('The gasoline hit the floor.');
+        break;
+      case 'door':
+        if (!ev.locked) {
+          this.audio.doorUnlock(ev.x, ev.z);
+          this.hud.banner('EMERGENCY DOOR UNLOCKED', 'good', 4);
+        } else {
+          this.hud.addSystem('The emergency door lost power and re-locked.');
+        }
+        break;
+      case 'sabotage':
+        this.audio.generatorStrain(ev.x, ev.z, ev.seconds);
+        this.hud.banner('THE GENERATOR IS LABOURING', 'bad', 4);
+        this.hud.addSystem(`${ev.by} poured the gasoline in. Get away from it.`);
+        break;
+      case 'spark':
+        this.audio.sparkArc(ev.x, ev.z);
+        this.fx.hitFlash(0.1, 0.12, '#ffb46a');
+        break;
+      case 'explosion':
+        this.audio.explosion(ev.x, ev.z);
+        this.audio.startEndingMusic();
+        this.fx.hitFlash(0.95, 1.4, '#ffd08a');
+        this.player.kick(3);
+        this.hud.banner('THE GENERATOR IS GONE', 'bad', 5);
+        this.hud.addSystem('Fire. The facility is burning.');
         break;
       case 'scream':
         this.audio.scream(ev.x, ev.z);
@@ -554,7 +611,8 @@ class Game {
     this.hud.setEndCountdown(Math.ceil(this.endCountdown));
     // Keep the world drifting behind the results card rather than freezing.
     this.entities.update(dt, this.localId, this.camera.position);
-    this.world.update(dt, this.camera.position, this.powered, this.exitOpen, this.generatorOn);
+    this.world.update(dt, this.camera.position, this.powered, this.exitOpen,
+      this.generatorOn, this.fire, this.camera);
   }
 
   updatePlaying(dt) {
@@ -564,7 +622,8 @@ class Game {
     if (this.player.state === PLAYER_STATE.DEAD) this.spectate(dt);
 
     this.entities.update(dt, this.localId, this.camera.position);
-    this.world.update(dt, this.player.position, this.powered, this.exitOpen, this.generatorOn);
+    this.world.update(dt, this.player.position, this.powered, this.exitOpen,
+      this.generatorOn, this.fire, this.camera);
 
     const threat = this.entities.nearestMonster(this.player.position);
     this.updateFear(dt, threat);
@@ -614,11 +673,25 @@ class Game {
     // Doing that with real lights would mean dozens of them; lifting ambient
     // does it for every room at once and costs nothing per pixel, while the
     // nearest ceiling lamps still supply local pools of light.
-    const targetAmbient = this.generatorOn ? AMBIENT_LIT : AMBIENT_BASE;
+    const burning = this.fire > 0;
+    const targetAmbient = burning
+      ? AMBIENT_BASE + this.fire * 2.5          // firelight, not floodlight
+      : this.generatorOn ? AMBIENT_LIT : AMBIENT_BASE;
     this.ambient.intensity += (targetAmbient - this.ambient.intensity) * Math.min(1, dt * 1.5);
-    // With the lights on you can see across a room, so the murk lifts too.
-    const targetFog = this.generatorOn ? 0.038 : 0.072;
+
+    // Smoke thickens as the fire spreads, and the room tone turns orange.
+    const targetFog = burning
+      ? 0.072 + this.fire * 0.09
+      : this.generatorOn ? 0.038 : 0.072;
     this.scene.fog.density += (targetFog - this.scene.fog.density) * Math.min(1, dt * 0.8);
+    if (burning) {
+      this.ambient.color.setRGB(0.45 + this.fire * 0.25, 0.22, 0.1);
+      this.scene.fog.color.setRGB(0.09 + this.fire * 0.08, 0.045, 0.03);
+    } else if (this.ambient.color.g < 0.5) {
+      this.ambient.color.setHex(0x18222c);
+      this.scene.fog.color.setHex(0x05070a);
+    }
+    this.audio.fireBed(this.fire);
   }
 
   // --- Interaction ----------------------------------------------------------
@@ -638,6 +711,12 @@ class Game {
       return;
     }
 
+    if (target.kind === 'locked') {
+      this.cancelHold();
+      this.hud.showPrompt('!', target.label, 0);
+      return;
+    }
+
     const holding = this.input.down('KeyE') && this.hold.cooldown === 0;
     if (holding) {
       // Changing target mid-hold restarts it, so you cannot bank progress.
@@ -652,7 +731,7 @@ class Game {
       const needed = HOLD_TIME[target.kind];
       if (this.hold.time >= needed) {
         this.net.use(target.kind, target.id);
-        if (target.kind === 'fuse') this.audio.pickup();
+        if (target.kind === 'fuse' || target.kind === 'battery' || target.kind === 'gas') this.audio.pickup();
         this.hold.cooldown = 0.7;
         this.cancelHold();
         this.hud.hidePrompt();
@@ -685,7 +764,7 @@ class Game {
     }
     if (this.exitOpen && this.map) {
       const e = this.map.exit;
-      candidates.push({ kind: 'exit', id: 0, x: e.x, z: e.z, label: 'Escape' });
+      candidates.push({ kind: 'exit', id: 0, x: e.x, z: e.z, label: 'Escape through the emergency door' });
     }
     // Once every fuse is seated the generator becomes a switch for the whole
     // building, and it can be thrown either way.
@@ -698,8 +777,19 @@ class Game {
     }
     for (const item of this.entities.interactables()) {
       if (item.kind === 'battery') candidates.push({ ...item, label: 'Take the battery' });
+      if (item.kind === 'gas') candidates.push({ ...item, label: 'Take the gasoline' });
     }
-    if (!this.carrying) {
+    // Carrying the can turns the generator into a second, very different option.
+    if (this.carryingGas && this.map && !this.sabotage) {
+      const g = this.map.generator;
+      candidates.push({ kind: 'pour', id: 0, x: g.x, z: g.z, label: 'Pour the gasoline in' });
+    }
+    // A dead door still tells you why it will not open.
+    if (this.map && !this.exitOpen) {
+      const e = this.map.exit;
+      candidates.push({ kind: 'locked', id: 0, x: e.x, z: e.z, label: 'Emergency door has no power' });
+    }
+    if (!this.carrying && !this.carryingGas) {
       for (const item of this.entities.interactables()) {
         if (item.kind === 'fuse') candidates.push({ ...item, label: 'Take the fuse' });
       }
@@ -714,7 +804,7 @@ class Game {
     for (const c of candidates) {
       const dx = c.x - pos.x, dz = c.z - pos.z;
       const dist = Math.hypot(dx, dz);
-      if (dist > REACH[c.kind]) continue;
+      if (dist > (REACH[c.kind] ?? 3.0)) continue;
       // Facing test, relaxed when you are almost on top of the thing.
       const facing = dist < 0.9 ? 1 : (dx * forward.x + dz * forward.z) / Math.max(dist, 0.001);
       if (facing < 0.25) continue;
@@ -734,7 +824,7 @@ class Game {
     if (Number.isFinite(threat.distance)) {
       const proximity = Math.max(0, 1 - threat.distance / 32);
       const weight = threat.state === MONSTER_STATE.CHASE ? 1
-        : threat.state === MONSTER_STATE.HUNT ? 0.5 : 0.25;
+        : threat.state === MONSTER_STATE.SEARCH ? 0.5 : 0.25;
       tension = proximity * weight;
     }
     if (this.player.state === PLAYER_STATE.DOWN) tension = Math.max(tension, 0.7);
@@ -763,7 +853,7 @@ class Game {
       this.growlTimer = 7 + Math.random() * 9;
       if (Number.isFinite(threat.distance) && threat.distance < 22 && threat.state !== MONSTER_STATE.CHASE) {
         for (const m of this.entities.monsters.values()) {
-          if (m.data.state === MONSTER_STATE.DORMANT) continue;
+          if (m.data.state === MONSTER_STATE.SLEEPING) continue;
           this.audio.growl(m.data.x, m.data.z, 0.8);
           break;
         }
@@ -798,7 +888,7 @@ class Game {
   updateHud(dt) {
     this.hud.setMeters(this.player.stamina, this.player.charge);
     this.hud.setReserve(this.player.reserve);
-    this.hud.setCarrying(!!this.carrying);
+    this.hud.setCarrying(this.carryingGas ? 'gas' : this.carrying ? 'fuse' : null);
     this.hud.setFusePips(this.powered, this.need);
     this.hud.setPing(this.net.ping);
 

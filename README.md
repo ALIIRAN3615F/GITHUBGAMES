@@ -46,7 +46,8 @@ Run on another port with `npm start -- --port 8081` (or set `PORT`).
 |---|---|
 | `W A S D` | move |
 | `Shift` | sprint — fast, and *loud* |
-| `Ctrl` / `C` | crouch — slow, and nearly silent |
+| `C` | crouch (toggle) — slow, and very hard to see |
+| `Ctrl` | hold to crouch |
 | `F` | flashlight on/off |
 | `E` | hold to interact (take fuse, seat fuse, take battery, throw the power switch, revive, escape) |
 | `R` | load a fresh battery into the flashlight |
@@ -73,6 +74,18 @@ door. After that it stays a switch: anyone standing at it can cut the power and
 put the building back into darkness. Sometimes you will want to. The lights make
 you visible from a long way off, and the thing down here is drawn to them - but
 the blast door, once open, stays open.
+
+**Two ways out.** Seat every fuse and the generator starts, which lights the
+building and throws the bolts on the emergency door - walk through it and you are
+out. Or find the gasoline can hidden in the far half of the facility, pour it into
+the generator, and take the other ending: the machine labours, sparks, and takes
+the building with it. The two never trigger each other, and the explosion cuts the
+power, so the door is not an escape hatch from your own decision.
+
+**You get time first.** The monster sleeps for the opening minutes - two and a
+half on Normal - and nothing you do wakes it early. That window is for learning
+the layout, finding batteries and locating the generator before anything is
+hunting you. When it does get up, you hear it.
 
 **The monster hunts by sound and light.** Sprinting is the loudest thing you can do.
 Your flashlight is a beacon it can see from across the level. Crouching in the dark makes you

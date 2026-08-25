@@ -374,18 +374,21 @@ test('a revived player bleeds out faster the next time', () => {
 test('the monster wakes, leaves its corner and can be heard', () => {
   const { session } = startedSession(1, { difficulty: 'normal' });
   const monster = session.monsters[0];
-  assert.strictEqual(monster.state, 'dormant');
+  assert.strictEqual(monster.state, 'sleeping');
   const start = { x: monster.x, z: monster.z };
 
-  for (let i = 0; i < 30 * 60; i++) session.update(1 / 30);   // 60 seconds
-  assert.notStrictEqual(monster.state, 'dormant', 'the monster never woke up');
+  // The exploration phase is deliberately long now, so run well past it.
+  const grace = session.difficulty().grace;
+  for (let i = 0; i < 30 * (grace + 20); i++) session.update(1 / 30);
+  assert.notStrictEqual(monster.state, 'sleeping', 'the monster never woke up');
+  assert.notStrictEqual(monster.state, 'waking', 'the monster never finished waking');
   const travelled = Math.hypot(monster.x - start.x, monster.z - start.z);
   assert.ok(travelled > 1, `the monster never moved (${travelled.toFixed(2)}m)`);
 
   // A loud noise nearby should pull it into an investigation.
   monster.state = 'patrol';
   session.hearNoise(monster.x + 2, monster.z, 1);
-  assert.strictEqual(monster.state, 'hunt', 'the monster ignored a noise at its feet');
+  assert.strictEqual(monster.state, 'search', 'the monster ignored a noise at its feet');
 });
 
 test('the monster stays inside the level', () => {
@@ -593,7 +596,8 @@ test('the generator switch is authoritative and only live once fully fused', () 
   // Now it is a switch, and either player can throw it.
   session.handle(a, { t: 'use', k: 'power' });
   assert.strictEqual(session.generatorOn, false, 'could not switch the power off');
-  assert.strictEqual(session.exitOpen, true, 'the blast door should stay open once opened');
+  // The emergency door runs off the same supply: no power, no exit.
+  assert.strictEqual(session.exitOpen, false, 'the exit stayed powered with the generator off');
 
   b.x = gen.x; b.z = gen.z;
   session.handle(b, { t: 'use', k: 'power' });

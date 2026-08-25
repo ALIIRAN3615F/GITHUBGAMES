@@ -488,6 +488,208 @@ export class AudioEngine {
     this.route(g, 1, x, z, { wet: 0.7, ref: 10, rolloff: 0.8 });
   }
 
+  // The generator tearing itself apart.
+  explosion(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+
+    // Body: a long noise burst swept from bright to sub.
+    const n = this.noiseSource(3.2, 0.7);
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(6000, t);
+    lp.frequency.exponentialRampToValueAtTime(90, t + 2.4);
+    const env = this.ctx.createGain();
+    env.gain.setValueAtTime(0.9, t);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + 3);
+    n.connect(lp).connect(env);
+    this.route(env, 1, x, z, { wet: 0.85, ref: 14, rolloff: 0.6 });
+
+    // Punch underneath it.
+    const o = this.ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(120, t);
+    o.frequency.exponentialRampToValueAtTime(24, t + 1.2);
+    const og = this.ctx.createGain();
+    og.gain.setValueAtTime(0.85, t);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+    o.connect(og);
+    this.route(og, 1, undefined, undefined, { wet: 0.5 });
+    o.start(t); o.stop(t + 1.7);
+
+    // Debris raining down afterwards.
+    for (let i = 0; i < 7; i++) {
+      const delay = 0.3 + Math.random() * 1.9;
+      setTimeout(() => this.clang(x + (Math.random() - 0.5) * 6, z + (Math.random() - 0.5) * 6), delay * 1000);
+    }
+  }
+
+  // An electrical arc while the generator labours.
+  sparkArc(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const dur = 0.16 + Math.random() * 0.14;
+    const n = this.noiseSource(dur, 1.6);
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 2600 + Math.random() * 2200;
+    bp.Q.value = 3;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.32, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    n.connect(bp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.5, ref: 5 });
+  }
+
+  // The generator struggling before it goes: pitch dragging, load rising.
+  generatorStrain(x, z, seconds) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(52, t);
+    o.frequency.linearRampToValueAtTime(96, t + seconds * 0.7);
+    o.frequency.linearRampToValueAtTime(38, t + seconds);
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 900;
+    lp.Q.value = 6;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.34, t + 1);
+    g.gain.setValueAtTime(0.34, t + seconds - 0.6);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + seconds);
+    o.connect(lp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.55, ref: 6 });
+    o.start(t); o.stop(t + seconds + 0.1);
+  }
+
+  // Bolts withdrawing, then the leaf lifting.
+  doorUnlock(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    for (const [delay, freq] of [[0, 180], [0.22, 150]]) {
+      const o = this.ctx.createOscillator();
+      o.type = 'square';
+      o.frequency.setValueAtTime(freq, t + delay);
+      o.frequency.exponentialRampToValueAtTime(freq * 0.4, t + delay + 0.12);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.3, t + delay);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + delay + 0.2);
+      o.connect(g);
+      this.route(g, 1, x, z, { wet: 0.6, ref: 6 });
+      o.start(t + delay); o.stop(t + delay + 0.25);
+    }
+    setTimeout(() => this.doorOpen(x, z), 420);
+  }
+
+  // A continuous fire bed, scaled by how far the blaze has spread. One looping
+  // noise source, not a sound per flame.
+  fireBed(level) {
+    if (!this.ready) return;
+    let loop = this.loops.get('fire');
+    if (!loop) {
+      const t = this.ctx.currentTime;
+      const out = this.ctx.createGain();
+      out.gain.value = 0;
+      out.connect(this.master);
+
+      const src = this.ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true;
+      const lp = this.ctx.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 1100; lp.Q.value = 0.7;
+      // Slow wobble so the roar breathes instead of hissing flatly.
+      const lfo = this.ctx.createOscillator();
+      lfo.frequency.value = 0.35;
+      const lfoGain = this.ctx.createGain();
+      lfoGain.gain.value = 320;
+      lfo.connect(lfoGain).connect(lp.frequency);
+      src.connect(lp).connect(out);
+      src.start(t); lfo.start(t);
+
+      const send = this.ctx.createGain();
+      send.gain.value = 0.4;
+      out.connect(send).connect(this.convolver);
+
+      loop = { nodes: [out, src, lfo], out };
+      this.loops.set('fire', loop);
+    }
+    loop.out.gain.setTargetAtTime(clamp(level, 0, 1) * 0.45, this.ctx.currentTime, 0.8);
+  }
+
+  // Original ending music, written here rather than sampled: a slow A minor
+  // lament. Sustained low strings, a descending four-note figure, no
+  // percussion and no resolution - survival, not victory.
+  startEndingMusic() {
+    if (!this.ready || this.loops.has('ending')) return;
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime + 0.2;
+
+    const out = ctx.createGain();
+    out.gain.value = 0.0001;
+    out.gain.exponentialRampToValueAtTime(0.5, t0 + 3);
+    out.connect(this.master);
+    const send = ctx.createGain();
+    send.gain.value = 0.75;         // drenched in the room's reverb
+    out.connect(send).connect(this.convolver);
+
+    const nodes = [out];
+
+    // Drone on the tonic, two octaves down.
+    for (const f of [55, 55.3]) {
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = f;
+      const g = ctx.createGain();
+      g.gain.value = 0.16;
+      o.connect(g).connect(out);
+      o.start(t0);
+      nodes.push(o);
+    }
+
+    // Am pad, entering slowly.
+    const pad = ctx.createBiquadFilter();
+    pad.type = 'lowpass';
+    pad.frequency.setValueAtTime(400, t0);
+    pad.frequency.linearRampToValueAtTime(1400, t0 + 16);
+    pad.connect(out);
+    for (const f of [220, 261.63, 329.63]) {    // A3 C4 E4
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = f;
+      o.detune.value = (Math.random() - 0.5) * 8;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.05, t0 + 6);
+      o.connect(g).connect(pad);
+      o.start(t0);
+      nodes.push(o);
+    }
+
+    // The figure: A - G - F - E, falling, then repeated a fifth below.
+    const melody = [
+      [440.00, 0], [392.00, 3.5], [349.23, 7], [329.63, 10.5],
+      [293.66, 15], [261.63, 18.5], [246.94, 22], [220.00, 25.5],
+      [329.63, 31], [293.66, 34.5], [261.63, 38], [220.00, 41.5],
+    ];
+    for (const [freq, at] of melody) {
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = freq;
+      const g = ctx.createGain();
+      const start = t0 + at;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(0.13, start + 0.7);   // slow bow
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 3.4);
+      o.connect(g).connect(out);
+      o.start(start); o.stop(start + 3.6);
+      nodes.push(o);
+    }
+
+    this.loops.set('ending', { nodes, out });
+  }
+
   // --- Continuous layers ----------------------------------------------------
 
   // Room tone: sub rumble, a filtered hiss, and a slow beating between two

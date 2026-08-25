@@ -15,7 +15,11 @@ const INTERP_DELAY = 110;    // ms
 const FLASHLIGHT_INTENSITY = 12;
 const BUFFER_MAX = 24;
 
-export const MONSTER_STATE = { DORMANT: 0, PATROL: 1, IDLE: 2, HUNT: 3, CHASE: 4, RETREAT: 5 };
+// Mirrors MONSTER_STATE_CODE on the server. SLEEPING means 'not in the level
+// yet' as far as the client is concerned.
+export const MONSTER_STATE = {
+  SLEEPING: 0, PATROL: 1, IDLE: 2, SEARCH: 3, CHASE: 4, RETREAT: 5, WAKING: 6, ATTACK: 7,
+};
 export const PLAYER_STATE = { ALIVE: 0, DOWN: 1, DEAD: 2, ESCAPED: 3 };
 
 // Mirrors the server's input flag bits.
@@ -152,6 +156,7 @@ export class Entities {
     this.syncMonsters(s, dt);
     this.syncFuses(s, dt);
     this.syncBatteries(s.b.b);
+    this.syncGas(s.b.gs);
     this.assignFlashlights(viewerPos);
   }
 
@@ -355,7 +360,7 @@ export class Entities {
       entity.group.rotation.y = yaw;
       entity.data = { state, x, z };
       // Dormant monsters are not in the level yet - do not spoil the surprise.
-      entity.group.visible = state !== MONSTER_STATE.DORMANT;
+      entity.group.visible = state !== MONSTER_STATE.SLEEPING;
       this.animateMonster(entity, dt, state);
     }
 
@@ -437,7 +442,7 @@ export class Entities {
   animateMonster(entity, dt, state) {
     const { parts } = entity;
     const chasing = state === MONSTER_STATE.CHASE;
-    const moving = state !== MONSTER_STATE.IDLE && state !== MONSTER_STATE.DORMANT;
+    const moving = state !== MONSTER_STATE.IDLE && state !== MONSTER_STATE.SLEEPING;
 
     entity.phase += dt * (chasing ? 11 : moving ? 4.5 : 1.2);
     const swing = Math.sin(entity.phase);
@@ -451,13 +456,13 @@ export class Entities {
     parts.head.rotation.z = Math.sin(entity.phase * 0.5) * 0.12;
     parts.jaw.rotation.x = Math.PI + (chasing ? Math.abs(swing) * 0.35 : 0.04);
 
-    const eyeBright = chasing ? 1 : state === MONSTER_STATE.HUNT ? 0.7 : 0.4;
+    const eyeBright = chasing ? 1 : state === MONSTER_STATE.SEARCH ? 0.7 : 0.4;
     parts.eyeL.material.color.setRGB(eyeBright, eyeBright * 0.24, eyeBright * 0.14);
     parts.eyeGlow.material.opacity = 0.3 + eyeBright * 0.5;
     parts.eyeGlow.scale.setScalar(0.55 + eyeBright * 0.35);
 
     if (parts.aura) {
-      parts.aura.intensity = chasing ? 9 + Math.sin(this.time * 12) * 3 : state === MONSTER_STATE.HUNT ? 3 : 0;
+      parts.aura.intensity = chasing ? 9 + Math.sin(this.time * 12) * 3 : state === MONSTER_STATE.SEARCH ? 3 : 0;
     }
     entity.group.position.y = Math.abs(swing) * (chasing ? 0.07 : 0.02);
   }
@@ -491,6 +496,74 @@ export class Entities {
       if (seen.has(id)) continue;
       this.root.remove(entity.group);
       this.fuses.delete(id);
+    }
+  }
+
+  // The fuel can: one per map, and it has to be obvious what it is from across
+  // a dark room - red, chunky, with a warning band and a spout.
+  makeGasCan() {
+    const group = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.32, 0.42, 0.19),
+      new THREE.MeshStandardMaterial({
+        color: 0xa8221a, roughness: 0.55, metalness: 0.45,
+        emissive: 0x521008, emissiveIntensity: 0.35,
+      })
+    );
+    body.position.y = 0.21;
+
+    const band = new THREE.Mesh(
+      new THREE.BoxGeometry(0.335, 0.09, 0.205),
+      new THREE.MeshStandardMaterial({
+        color: 0xe0c23a, roughness: 0.6,
+        emissive: 0x6a5410, emissiveIntensity: 0.5,
+      })
+    );
+    band.position.y = 0.2;
+
+    const spout = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.035, 0.045, 0.16, 8),
+      new THREE.MeshStandardMaterial({ color: 0x2a2c2e, roughness: 0.7, metalness: 0.4 })
+    );
+    spout.position.set(0.1, 0.47, 0);
+    spout.rotation.z = -0.5;
+
+    const handle = new THREE.Mesh(
+      new THREE.TorusGeometry(0.08, 0.018, 6, 10, Math.PI),
+      new THREE.MeshStandardMaterial({ color: 0x2a2c2e, roughness: 0.7, metalness: 0.4 })
+    );
+    handle.position.set(-0.06, 0.44, 0);
+    handle.rotation.y = Math.PI / 2;
+
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: this.glowTex, color: 0xff6a3a, transparent: true,
+      opacity: 0.3, depthWrite: false, blending: THREE.AdditiveBlending,
+    }));
+    halo.scale.set(1.1, 1.1, 1);
+    halo.position.y = 0.25;
+
+    group.add(body, band, spout, handle, halo);
+    return { group, parts: { body, halo }, data: {} };
+  }
+
+  // The can lives in the world until somebody pours it into the generator.
+  syncGas(row) {
+    if (!row) {
+      if (this.gasCan) this.gasCan.group.visible = false;
+      return;
+    }
+    if (!this.gasCan) {
+      this.gasCan = this.makeGasCan();
+      this.root.add(this.gasCan.group);
+    }
+    const [x, z, state] = row;
+    this.gasState = state;
+    // state 0 on the floor, 1 carried, 2 already poured in.
+    this.gasCan.group.visible = state === 0;
+    if (state === 0) {
+      this.gasCan.group.position.set(x, 0.03 + Math.sin(this.time * 1.3) * 0.03, z);
+      this.gasCan.group.rotation.y += 0.004;
+      this.gasCan.parts.halo.material.opacity = 0.22 + Math.sin(this.time * 2) * 0.1;
     }
   }
 
@@ -564,9 +637,9 @@ export class Entities {
 
   // Nearest monster distance, used to drive tension audio and the fear vignette.
   nearestMonster(pos) {
-    let best = Infinity, state = MONSTER_STATE.DORMANT;
+    let best = Infinity, state = MONSTER_STATE.SLEEPING;
     for (const m of this.monsters.values()) {
-      if (!m.data || m.data.state === MONSTER_STATE.DORMANT) continue;
+      if (!m.data || m.data.state === MONSTER_STATE.SLEEPING) continue;
       const d = Math.hypot(m.data.x - pos.x, m.data.z - pos.z);
       if (d < best) { best = d; state = m.data.state; }
     }
@@ -576,6 +649,12 @@ export class Entities {
   // Everything the local player could interact with right now.
   interactables() {
     const out = [];
+    if (this.gasCan && this.gasState === 0 && this.gasCan.group.visible) {
+      out.push({
+        kind: 'gas', id: 0,
+        x: this.gasCan.group.position.x, z: this.gasCan.group.position.z,
+      });
+    }
     for (const b of this.batteryPoints || []) {
       if (!this.takenBatteries || !this.takenBatteries.has(b.id)) {
         out.push({ kind: 'battery', id: b.id, x: b.x, z: b.z });

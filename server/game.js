@@ -37,10 +37,25 @@ const MONSTER_RADIUS = 0.4;
 const FLASHLIGHT_DRAIN = 1.0;      // percent per second while lit
 const MAX_RESERVE = 24;
 
+// Monster perception timings.
+//
+// grace (above) is the exploration phase - long enough to actually learn the
+// map, find batteries and locate the generator before anything hunts you.
+const WAKE_DURATION = 8;        // it gets up noisily before it starts moving
+const STAND_EXPOSURE = 0.3;     // seconds in view before a standing player is locked
+const CROUCH_EXPOSURE = 1.6;    // a crouching player has to be stared at
+const LOSE_GRACE = 2.5;         // how long a chase survives with no perception
+const SEARCH_TIME = 14;         // how long it hunts around a last known position
+
+// The sabotage ending. Deliberately slow: the point is the dread between
+// pouring the fuel and the bang.
+const UNSTABLE_TIME = 8;        // generator labouring, sparking, before it goes
+const BURN_TIME = 20;           // the facility burning before the ending lands
+
 const DIFFICULTY = {
-  calm:      { patrol: 2.0, chase: 4.05, hearing: 17, sight: 17, grace: 40, bleed: 60, monsters: 1, label: 'Calm' },
-  normal:    { patrol: 2.4, chase: 4.70, hearing: 23, sight: 21, grace: 25, bleed: 45, monsters: 1, label: 'Normal' },
-  nightmare: { patrol: 2.9, chase: 5.30, hearing: 31, sight: 26, grace: 12, bleed: 30, monsters: 2, label: 'Nightmare' },
+  calm:      { patrol: 2.0, chase: 4.05, hearing: 17, sight: 17, grace: 210, bleed: 60, monsters: 1, label: 'Calm' },
+  normal:    { patrol: 2.4, chase: 4.70, hearing: 23, sight: 21, grace: 150, bleed: 45, monsters: 1, label: 'Normal' },
+  nightmare: { patrol: 2.9, chase: 5.30, hearing: 31, sight: 26, grace: 90, bleed: 30, monsters: 2, label: 'Nightmare' },
 };
 
 const PLAYER_COLORS = [
@@ -53,7 +68,9 @@ const ST_ALIVE = 0, ST_DOWN = 1, ST_DEAD = 2, ST_ESCAPED = 3;
 let nextPlayerId = 1;
 
 class Session {
-  constructor() {
+  // `seed` makes a session's randomness reproducible, which is what lets the
+  // monster tests assert on behaviour instead of on luck.
+  constructor(opts = {}) {
     this.players = new Map();       // id -> player
     this.phase = 'lobby';           // lobby | playing | ended
     this.hostId = null;
@@ -63,6 +80,10 @@ class Session {
     this.monsters = [];
     this.fuses = [];
     this.batteries = [];
+    this.gas = null;
+    this.sabotage = null;
+    this.fire = 0;
+    this.ending = null;
     this.powered = 0;
     this.exitOpen = false;
     this.generatorOn = false;
@@ -70,7 +91,7 @@ class Session {
     this.roundTime = 0;
     this.endsAt = 0;
     this.outcome = null;
-    this.rng = makeRng((Date.now() ^ 0x5f3a) >>> 0);
+    this.rng = makeRng(opts.seed !== undefined ? opts.seed : ((Date.now() ^ 0x5f3a) >>> 0));
     this.ambientTimer = 8;
   }
 
@@ -98,6 +119,7 @@ class Session {
       reserve: 0,           // spare batteries carried
 
       carrying: null,
+      carryingGas: false,
       downTimer: 0,
       downs: 0,
       bleedTotal: 0,
@@ -132,6 +154,7 @@ class Session {
     const player = this.players.get(id);
     if (!player) return;
     if (player.carrying !== null) this.dropFuse(player);
+    if (player.carryingGas) this.dropGasoline(player);
     this.players.delete(id);
     if (this.hostId === id) this.hostId = this.players.keys().next().value ?? null;
     this.event({ k: 'left', name: player.name });
@@ -200,6 +223,8 @@ class Session {
       case 'battery': return this.takeBattery(player, msg.id);
       case 'reload': return this.reloadFlashlight(player);
       case 'power':  return this.toggleGenerator(player);
+      case 'gas':    return this.takeGasoline(player);
+      case 'pour':   return this.pourGasoline(player);
       default:       return undefined;
     }
   }
@@ -252,6 +277,12 @@ class Session {
 
     this.fuses = this.map.fuses.map((f) => ({ id: f.id, x: f.x, z: f.z, state: 0, holder: null }));
     this.batteries = this.map.batteries.map((b) => ({ id: b.id, x: b.x, z: b.z, taken: false }));
+    this.gas = this.map.gasoline
+      ? { x: this.map.gasoline.x, z: this.map.gasoline.z, state: 0, holder: null }
+      : null;
+    this.sabotage = null;
+    this.fire = 0;
+    this.ending = null;
     this.powered = 0;
     this.exitOpen = false;
     this.generatorOn = false;
@@ -275,6 +306,7 @@ class Session {
       p.stats = { fuses: 0, revives: 0, escaped: false, batteries: 0 };
       p.charge = 100;
       p.reserve = 0;
+      p.carryingGas = false;
       this.placeAtSpawn(p);
     }
 
@@ -309,8 +341,10 @@ class Session {
     return {
       id: index,
       x: pos.x, z: pos.z, yaw: 0,
-      state: 'dormant',
-      timer: diff.grace + index * 6,
+      state: 'sleeping',
+      timer: diff.grace + index * 15,
+      exposure: new Map(),      // per-player seconds held in view
+      searchTimer: 0,
       path: [], pathIdx: 0, repathIn: 0,
       targetId: null,
       lastKnown: null,
@@ -326,6 +360,10 @@ class Session {
     this.fuses = [];
     this.batteries = [];
     this.generatorOn = false;
+    this.gas = null;
+    this.sabotage = null;
+    this.fire = 0;
+    this.ending = null;
     this.map = null;
     this.grid = null;
     for (const p of this.players.values()) { p.ready = false; p.state = ST_ALIVE; p.carrying = null; }
@@ -382,10 +420,17 @@ class Session {
     this.hearNoise(gen.x, gen.z, complete ? 3.0 : 1.6);
 
     if (complete) {
-      this.exitOpen = true;          // the blast door latches open once opened
       this.generatorOn = true;
+      this.exitOpen = true;
+      this.event({ k: 'door', locked: false, x: this.map.exit.x, z: this.map.exit.z });
       this.event({ k: 'power', on: true, x: this.map.exit.x, z: this.map.exit.z });
-      for (const m of this.monsters) { m.state = 'hunt'; m.lastKnown = { x: gen.x, z: gen.z }; m.repathIn = 0; }
+      for (const m of this.monsters) {
+        if (m.state === 'sleeping' || m.state === 'waking') continue;
+        m.state = 'search';
+        m.searchTimer = SEARCH_TIME;
+        m.lastKnown = { x: gen.x, z: gen.z };
+        m.repathIn = 0;
+      }
     }
   }
 
@@ -425,9 +470,95 @@ class Session {
     if (dist2(player.x, player.z, gen.x, gen.z) > 4.0 * 4.0) return;
 
     this.generatorOn = !this.generatorOn;
+    // The emergency door is wired to the same supply.
+    this.exitOpen = this.generatorOn;
     this.event({ k: 'power', on: this.generatorOn, by: player.name, x: gen.x, z: gen.z });
+    this.event({ k: 'door', locked: !this.generatorOn, x: this.map.exit.x, z: this.map.exit.z });
     // Throwing the switch either way is loud.
     this.hearNoise(gen.x, gen.z, 2.0);
+  }
+
+// --- Ending 2: the fuel can ----------------------------------------------
+
+  takeGasoline(player) {
+    if (player.state !== ST_ALIVE || !this.gas || this.gas.state !== 0) return;
+    if (player.carrying !== null || player.carryingGas) return;   // one thing at a time
+    if (dist2(player.x, player.z, this.gas.x, this.gas.z) > 3.2 * 3.2) return;
+
+    this.gas.state = 1;
+    this.gas.holder = player.id;
+    player.carryingGas = true;
+    this.event({ k: 'gas-taken', by: player.name, id: player.id });
+    this.hearNoise(player.x, player.z, 0.5);
+  }
+
+  dropGasoline(player) {
+    if (!player.carryingGas || !this.gas) return;
+    player.carryingGas = false;
+    this.gas.state = 0;
+    this.gas.holder = null;
+    this.gas.x = player.x;
+    this.gas.z = player.z;
+    this.event({ k: 'gas-dropped', x: this.gas.x, z: this.gas.z });
+  }
+
+  // Emptying the can into the generator. This does not explode anything on its
+  // own - it starts a timeline the whole server then plays out together.
+  pourGasoline(player) {
+    if (player.state !== ST_ALIVE || !player.carryingGas) return;
+    if (this.sabotage || this.ending) return;
+    const gen = this.map.generator;
+    if (dist2(player.x, player.z, gen.x, gen.z) > 4.0 * 4.0) return;
+
+    player.carryingGas = false;
+    this.gas.state = 2;
+    this.gas.holder = null;
+    this.sabotage = { phase: 'unstable', timer: UNSTABLE_TIME, sparkIn: 0 };
+
+    this.event({ k: 'sabotage', by: player.name, x: gen.x, z: gen.z, seconds: UNSTABLE_TIME });
+    // Pouring is loud, and the generator labouring is louder.
+    this.hearNoise(gen.x, gen.z, 2.5);
+  }
+
+  // Runs the unstable -> explosion -> burning -> ending sequence.
+  updateSabotage(dt) {
+    if (!this.sabotage) return;
+    const gen = this.map.generator;
+    const s = this.sabotage;
+    s.timer -= dt;
+
+    if (s.phase === 'unstable') {
+      // Sparks and lurching, at a pace the clients can render cheaply.
+      s.sparkIn -= dt;
+      if (s.sparkIn <= 0) {
+        s.sparkIn = 0.6 + this.rng() * 0.7;
+        this.event({ k: 'spark', x: gen.x, z: gen.z, left: Math.max(0, Math.round(s.timer)) });
+      }
+      if (s.timer <= 0) {
+        s.phase = 'burning';
+        s.timer = BURN_TIME;
+        // The generator tears itself apart: no power, so no lit exit either.
+        this.generatorOn = false;
+        this.exitOpen = false;
+        this.fire = 0.001;
+        this.event({ k: 'explosion', x: gen.x, z: gen.z });
+        // Everything in the building hears that.
+        for (const m of this.monsters) {
+          if (m.state === 'sleeping' || m.state === 'waking') continue;
+          m.state = 'search';
+          m.searchTimer = SEARCH_TIME;
+          m.lastKnown = { x: gen.x, z: gen.z };
+          m.repathIn = 0;
+        }
+      }
+      return;
+    }
+
+    if (s.phase === 'burning') {
+      // Fire spreads outward from the generator over the burn window.
+      this.fire = Math.min(1, 1 - s.timer / BURN_TIME);
+      if (s.timer <= 0) this.endRound('burned');
+    }
   }
 
   revive(player, targetId) {
@@ -443,7 +574,9 @@ class Session {
   }
 
   escape(player) {
-    if (player.state !== ST_ALIVE || !this.exitOpen) return;
+    if (player.state !== ST_ALIVE) return;
+    // The emergency door is an electrical lock: no power, no way out.
+    if (!this.generatorOn || !this.exitOpen) return;
     const exit = this.map.exit;
     if (dist2(player.x, player.z, exit.x, exit.z) > 4.5 * 4.5) return;
     player.state = ST_ESCAPED;
@@ -455,11 +588,15 @@ class Session {
 
   downPlayer(player, monster) {
     if (player.state !== ST_ALIVE) return;
+    // Once the facility is burning the ending is committed; the monster must
+    // not be able to make it unreachable.
+    if (this.ending || (this.sabotage && this.sabotage.phase === 'burning')) return;
     player.state = ST_DOWN;
     player.downs++;
     // Each rescue buys less time than the last: the third mistake is usually fatal.
     player.downTimer = this.difficulty().bleed * Math.pow(0.72, player.downs - 1);
     if (player.carrying !== null) this.dropFuse(player);
+    if (player.carryingGas) this.dropGasoline(player);
     this.event({ k: 'down', who: player.name, id: player.id, x: player.x, z: player.z });
     if (monster) {
       monster.state = 'retreat';
@@ -488,8 +625,10 @@ class Session {
   }
 
   endRound(outcome) {
+    if (this.phase === 'ended') return;
     this.phase = 'ended';
     this.outcome = outcome;
+    this.ending = outcome;
     this.endsAt = Date.now() + 14000;
     this.broadcast({
       t: 'end',
@@ -521,6 +660,7 @@ class Session {
       }
     }
 
+    this.updateSabotage(dt);
     this.drainFlashlights(dt);
     for (const m of this.monsters) this.updateMonster(m, dt);
     this.updateDirector(dt);
@@ -545,50 +685,110 @@ class Session {
     }
   }
 
+  // How loud and how visible a player is, by stance. Crouching is the whole
+  // stealth system: it cuts what the monster can hear to almost nothing and,
+  // crucially, shrinks how far away it can pick you out at all.
+  stanceOf(p) {
+    if (p.state === ST_DOWN) return { noise: 0.45, visibility: 0.70 };
+    const moving = (p.flags & F_MOVING) !== 0;
+    if (p.flags & F_CROUCH) {
+      return moving ? { noise: 0.14, visibility: 0.30 } : { noise: 0.02, visibility: 0.18 };
+    }
+    if (!moving) return { noise: 0.04, visibility: 0.65 };
+    if (p.flags & F_SPRINT) return { noise: 1.00, visibility: 1.00 };
+    return { noise: 0.55, visibility: 0.85 };
+  }
+
+  // What one monster can currently tell about one player. Nothing here reaches
+  // through geometry: sight needs line of sight, and hearing is a range check
+  // that yields a position, never a lock.
+  perceive(m, p, hearing, sight) {
+    const d = Math.hypot(p.x - m.x, p.z - m.z);
+    const stance = this.stanceOf(p);
+    let noise = stance.noise;
+    let visibility = stance.visibility;
+
+    // Working on something - seating a fuse, pouring fuel - is loud.
+    if (p.flags & F_BUSY) noise = Math.max(noise, 0.8);
+    // A lit flashlight is the single loudest thing you can do to your profile.
+    if (p.flags & F_LIGHT) { noise += 0.25; visibility *= 2.0; }
+    // Lit rooms make you easier to see. They do not make you noisier.
+    if (this.generatorOn) visibility *= 1.35;
+
+    const heard = d < hearing * noise;
+    // Sight is gated behind line of sight, always.
+    const los = (heard || d < sight * visibility)
+      ? hasLineOfSight(this.grid, this.map.w, this.map.h, this.map.cell, m.x, m.z, p.x, p.z)
+      : false;
+    const seen = los && d < sight * visibility;
+    return { d, los, heard, seen, noise, visibility };
+  }
+
   updateMonster(m, dt) {
     const diff = this.difficulty();
     const aggro = this.map.fuseCount ? this.powered / this.map.fuseCount : 0;
-    const speedMul = 1 + aggro * 0.16 + (this.exitOpen ? 0.1 : 0);
-    const hearing = diff.hearing * (1 + aggro * 0.55);
-    const sight = diff.sight * (1 + aggro * 0.25);
+    const speedMul = 1 + aggro * 0.16;
+    const hearing = diff.hearing * (1 + aggro * 0.4);
+    const sight = diff.sight * (1 + aggro * 0.2);
 
     m.attackCooldown = Math.max(0, m.attackCooldown - dt);
     m.screamCooldown = Math.max(0, m.screamCooldown - dt);
 
-    if (m.state === 'dormant') {
+    // --- Sleeping: the exploration phase ------------------------------------
+    if (m.state === 'sleeping') {
       m.timer -= dt;
-      if (m.timer <= 0) { m.state = 'patrol'; m.path = []; this.event({ k: 'wake', x: m.x, z: m.z }); }
+      if (m.timer <= 0) {
+        m.state = 'waking';
+        m.timer = WAKE_DURATION;
+        // An event in its own right, not a silent flag flip.
+        this.event({ k: 'waking', x: m.x, z: m.z, id: m.id });
+      }
       return;
     }
 
-    // --- Perception ---------------------------------------------------------
+    // --- Waking: it gets up, and everyone hears it ---------------------------
+    if (m.state === 'waking') {
+      m.timer -= dt;
+      if (m.timer <= 0) {
+        m.state = 'patrol';
+        m.path = [];
+        this.event({ k: 'awake', x: m.x, z: m.z, id: m.id });
+      }
+      return;
+    }
+
+    // --- Perception ----------------------------------------------------------
     let best = null;
     for (const p of this.players.values()) {
       if (p.state !== ST_ALIVE && p.state !== ST_DOWN) continue;
-      const d = Math.hypot(p.x - m.x, p.z - m.z);
-      const los = hasLineOfSight(this.grid, this.map.w, this.map.h, this.map.cell, m.x, m.z, p.x, p.z);
+      const info = this.perceive(m, p, hearing, sight);
+      if (!info.heard && !info.seen) {
+        // Exposure decays while it cannot see you, so slipping behind a crate
+        // for a moment genuinely helps.
+        const cur = m.exposure.get(p.id) || 0;
+        if (cur > 0) m.exposure.set(p.id, Math.max(0, cur - dt * 1.5));
+        continue;
+      }
 
-      let noise = 0.06;
-      if (p.state === ST_DOWN) noise = 0.5;                     // whimpering gives you away
-      else if ((p.flags & F_SPRINT) && (p.flags & F_MOVING)) noise = 1.0;
-      else if (p.flags & F_CROUCH) noise = (p.flags & F_MOVING) ? 0.22 : 0.05;
-      else if (p.flags & F_MOVING) noise = 0.6;
-      if (p.flags & F_BUSY) noise = Math.max(noise, 0.85);
-      if (p.flags & F_LIGHT) noise += los ? 0.55 : 0.12;        // light is a beacon
-      if (this.exitOpen) noise += 0.5;                          // the alarm draws it to you
+      // Being visible is not instant recognition. A crouching player has to be
+      // held in view far longer before the monster is sure enough to commit.
+      if (info.seen) {
+        const need = (p.flags & F_CROUCH) ? CROUCH_EXPOSURE : STAND_EXPOSURE;
+        const cur = (m.exposure.get(p.id) || 0) + dt;
+        m.exposure.set(p.id, cur);
+        info.acquired = cur >= need;
+      } else {
+        info.acquired = false;
+      }
 
-      const heard = d < hearing * noise;
-      const seen = los && d < sight && ((p.flags & F_LIGHT) || d < sight * 0.6);
-      if (!heard && !seen) continue;
-
-      const score = (seen ? 1000 : 0) + (1000 - d) + noise * 200;
-      if (!best || score > best.score) best = { p, d, los, seen, heard, score };
+      const score = (info.acquired ? 1000 : 0) + (info.heard ? 200 : 0) + (400 - info.d);
+      if (!best || score > best.score) best = { p, ...info, score };
     }
 
-    if (best) {
-      m.lastKnown = { x: best.p.x, z: best.p.z };
-      const shouldChase = best.p.state === ST_ALIVE && (best.seen || (best.heard && best.d < hearing * 0.5));
-      if (shouldChase && m.state !== 'retreat') {
+    // --- Acquisition ---------------------------------------------------------
+    if (best && m.state !== 'retreat' && m.state !== 'attack') {
+      if (best.acquired && best.p.state === ST_ALIVE) {
+        // Seen clearly enough to commit: lock on.
         if (m.state !== 'chase') {
           m.state = 'chase';
           m.repathIn = 0;
@@ -598,14 +798,20 @@ class Session {
           }
         }
         m.targetId = best.p.id;
-        m.loseTimer = 6;
-      } else if (m.state === 'patrol' || m.state === 'idle') {
-        m.state = 'hunt';
-        m.repathIn = 0;
+        m.lastKnown = { x: best.p.x, z: best.p.z };
+        m.loseTimer = LOSE_GRACE;
+      } else if (best.heard) {
+        // Heard something. That gives a place to look, not a target to follow.
+        m.lastKnown = { x: best.p.x, z: best.p.z };
+        if (m.state === 'patrol' || m.state === 'idle') {
+          m.state = 'search';
+          m.searchTimer = SEARCH_TIME;
+          m.repathIn = 0;
+        }
       }
     }
 
-    // --- State machine ------------------------------------------------------
+    // --- State machine -------------------------------------------------------
     let speed = diff.patrol * speedMul;
 
     switch (m.state) {
@@ -613,57 +819,128 @@ class Session {
         if (!m.path.length) this.repath(m, this.randomFarCell(m));
         break;
       }
+
       case 'idle': {
         m.timer -= dt;
         m.yaw += dt * 1.6;
         if (m.timer <= 0) { m.state = 'patrol'; m.path = []; }
         return;
       }
-      case 'hunt': {
+
+      case 'search': {
+        // Go to where the player was last known to be - not where they are.
         speed = (diff.patrol + diff.chase) * 0.5 * speedMul;
+        m.searchTimer -= dt;
         m.repathIn -= dt;
+
         if (m.lastKnown && (!m.path.length || m.repathIn <= 0)) {
           m.repathIn = 1.2;
           this.repath(m, worldToCell(m.lastKnown.x, m.lastKnown.z, this.map.w, this.map.h));
         }
-        if (!m.path.length) { m.state = 'idle'; m.timer = 2.5 + this.rng() * 2; m.lastKnown = null; }
+        if (!m.path.length) {
+          // Arrived and found nothing: cast about nearby before giving up.
+          if (m.searchTimer > 0) {
+            const probe = this.randomNearbyCell(m, 4);
+            if (probe) this.repath(m, probe);
+            else m.searchTimer = 0;
+          } else {
+            m.state = 'idle';
+            m.timer = 2 + this.rng() * 2;
+            m.lastKnown = null;
+            m.targetId = null;
+            m.exposure.clear();
+            this.event({ k: 'lost', id: m.id });
+          }
+        }
         break;
       }
+
       case 'chase': {
         speed = diff.chase * speedMul;
         const target = this.players.get(m.targetId);
         if (!target || (target.state !== ST_ALIVE && target.state !== ST_DOWN)) {
-          m.state = 'hunt'; m.repathIn = 0; break;
+          m.state = 'search'; m.searchTimer = SEARCH_TIME; m.repathIn = 0; break;
         }
-        m.loseTimer -= dt;
-        if (!best && m.loseTimer <= 0) { m.state = 'hunt'; m.repathIn = 0; break; }
+
+        // Only a live perception refreshes what it knows. Once the player
+        // breaks contact - round a corner, drop into a crouch - the monster is
+        // running at a memory, and that memory goes stale.
+        const stillOn = best && best.p.id === m.targetId && (best.acquired || best.heard);
+        if (stillOn) {
+          m.lastKnown = { x: best.p.x, z: best.p.z };
+          m.loseTimer = LOSE_GRACE;
+        } else {
+          m.loseTimer -= dt;
+          if (m.loseTimer <= 0) {
+            m.state = 'search';
+            m.searchTimer = SEARCH_TIME;
+            m.repathIn = 0;
+            m.exposure.clear();
+            this.event({ k: 'lost', id: m.id });
+            break;
+          }
+        }
 
         m.repathIn -= dt;
-        if (m.repathIn <= 0) {
-          m.repathIn = 0.35;
-          this.repath(m, worldToCell(target.x, target.z, this.map.w, this.map.h));
+        if (m.repathIn <= 0 && m.lastKnown) {
+          m.repathIn = 0.4;
+          this.repath(m, worldToCell(m.lastKnown.x, m.lastKnown.z, this.map.w, this.map.h));
         }
+
+        // It can only swing at what it is actually next to.
         const d = Math.hypot(target.x - m.x, target.z - m.z);
         if (d < 1.9 && m.attackCooldown <= 0 && target.state === ST_ALIVE) {
           m.attackCooldown = 3;
+          m.state = 'attack';
+          m.timer = 0.6;
           this.downPlayer(target, m);
           return;
         }
         break;
       }
+
+      case 'attack': {
+        m.timer -= dt;
+        if (m.timer <= 0) { m.state = 'retreat'; m.timer = 7; m.path = []; }
+        return;
+      }
+
       case 'retreat': {
         speed = diff.chase * 0.9 * speedMul;
         m.timer -= dt;
         if (!m.path.length) this.repath(m, this.randomFarCell(m));
-        if (m.timer <= 0) { m.state = 'patrol'; m.path = []; m.lastKnown = null; }
+        if (m.timer <= 0) {
+          m.state = 'patrol';
+          m.path = [];
+          m.lastKnown = null;
+          m.targetId = null;
+          m.exposure.clear();
+        }
         break;
       }
+
       default:
         m.state = 'patrol';
     }
 
     this.moveAlongPath(m, speed, dt);
   }
+
+  // A cell within `radius` of the monster's last known point, for casting about
+  // during a search.
+  randomNearbyCell(m, radius) {
+    if (!m.lastKnown) return null;
+    const centre = worldToCell(m.lastKnown.x, m.lastKnown.z, this.map.w, this.map.h);
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const cx = centre.cx + Math.round((this.rng() - 0.5) * radius * 2);
+      const cy = centre.cy + Math.round((this.rng() - 0.5) * radius * 2);
+      if (cx < 1 || cy < 1 || cx >= this.map.w - 1 || cy >= this.map.h - 1) continue;
+      if (this.grid[idx(cx, cy, this.map.w)] !== 1) continue;
+      return { cx, cy };
+    }
+    return null;
+  }
+
 
   repath(m, goalCell) {
     if (!goalCell) return;
@@ -783,11 +1060,13 @@ class Session {
   // A noise loud enough to be worth investigating pulls nearby monsters in.
   hearNoise(x, z, strength) {
     for (const m of this.monsters) {
-      if (m.state === 'dormant' || m.state === 'chase' || m.state === 'retreat') continue;
+      if (m.state === 'sleeping' || m.state === 'waking') continue;
+      if (m.state === 'chase' || m.state === 'retreat' || m.state === 'attack') continue;
       const d = Math.hypot(m.x - x, m.z - z);
       if (d > this.difficulty().hearing * strength) continue;
       m.lastKnown = { x, z };
-      m.state = 'hunt';
+      m.state = 'search';
+      m.searchTimer = SEARCH_TIME;
       m.repathIn = 0;
     }
   }
@@ -842,9 +1121,13 @@ class Session {
       f: this.fuses.map((f) => [f.id, round2(f.x), round2(f.z), f.state, f.holder ?? -1]),
       // Battery rows: [id, x, z, taken]
       b: this.batteries.map((b) => [b.id, round2(b.x), round2(b.z), b.taken ? 1 : 0]),
+      // Gasoline: [x, z, state, holder]. state 0 floor, 1 carried, 2 poured.
+      gs: this.gas ? [round2(this.gas.x), round2(this.gas.z), this.gas.state, this.gas.holder ?? -1] : null,
       g: this.powered,
       x: this.exitOpen ? 1 : 0,
       o: this.generatorOn ? 1 : 0,
+      sb: this.sabotage ? this.sabotage.phase : null,
+      fi: Math.round(this.fire * 100) / 100,
     });
   }
 
@@ -870,7 +1153,11 @@ class Session {
   }
 }
 
-const MONSTER_STATE_CODE = { dormant: 0, patrol: 1, idle: 2, hunt: 3, chase: 4, retreat: 5 };
+// Wire codes for monster state. 0 is 'not in the level yet' as far as the
+// client is concerned; waking is its own visible beat.
+const MONSTER_STATE_CODE = {
+  sleeping: 0, patrol: 1, idle: 2, search: 3, chase: 4, retreat: 5, waking: 6, attack: 7,
+};
 
 function sanitiseName(name, id) {
   const clean = String(name ?? '').replace(/[^\w \-.'\[\]]/g, '').trim().slice(0, 16);
