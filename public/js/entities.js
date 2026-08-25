@@ -34,9 +34,26 @@ export class Entities {
     this.eyeGlowTex = TEX.glowSprite('#ff5544');
     this.nameCache = new Map();
     this.time = 0;
+
+    // Other players' torches have to actually light the room - a translucent
+    // cone alone reads as a bug. Real spotlights are expensive, so a small pool
+    // is shared out to the nearest torch-bearers each frame. No shadows: the
+    // shadow map is what costs, not the light.
+    this.torchPool = [];
+    const poolSize = quality === 'low' ? 0 : quality === 'high' ? 3 : 2;
+    for (let i = 0; i < poolSize; i++) {
+      const light = new THREE.SpotLight(0xffe8c4, 0, 26, 0.5, 0.62, 1.25);
+      light.castShadow = false;
+      light.visible = false;
+      const target = new THREE.Object3D();
+      this.root.add(light, target);
+      light.target = target;
+      this.torchPool.push({ light, target });
+    }
   }
 
   reset() {
+    for (const slot of this.torchPool) { slot.light.visible = false; slot.light.intensity = 0; }
     for (const map of [this.players, this.monsters, this.fuses]) {
       for (const e of map.values()) this.root.remove(e.group);
       map.clear();
@@ -72,7 +89,7 @@ export class Entities {
     return { a: last, b: last, alpha: 0 };
   }
 
-  update(dt, localId, torchPool) {
+  update(dt, localId, viewerPos) {
     this.time += dt;
     const s = this.sample();
     if (!s) return;
@@ -80,6 +97,39 @@ export class Entities {
     this.syncPlayers(s, localId, dt);
     this.syncMonsters(s, dt);
     this.syncFuses(s, dt);
+    this.assignTorches(viewerPos);
+  }
+
+  // Hand the light pool to the nearest teammates whose torch is on.
+  assignTorches(viewerPos) {
+    if (!this.torchPool.length) return;
+
+    const lit = [];
+    for (const entity of this.players.values()) {
+      if (!entity.data || entity.data.state !== PLAYER_STATE.ALIVE) continue;
+      if (!(entity.data.flags & FLAG.LIGHT)) continue;
+      const d = viewerPos
+        ? entity.group.position.distanceTo(viewerPos)
+        : 0;
+      lit.push({ entity, d });
+    }
+    lit.sort((a, b) => a.d - b.d);
+
+    for (let i = 0; i < this.torchPool.length; i++) {
+      const slot = this.torchPool[i];
+      const owner = lit[i];
+      if (!owner) { slot.light.visible = false; slot.light.intensity = 0; continue; }
+
+      const g = owner.entity.group;
+      // The avatar's forward is local -Z, matching the camera convention its
+      // yaw came from.
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(g.quaternion);
+      slot.light.visible = true;
+      slot.light.intensity = 11;
+      slot.light.position.set(g.position.x, g.position.y + 1.5, g.position.z);
+      slot.light.position.addScaledVector(forward, 0.25);
+      slot.target.position.copy(slot.light.position).addScaledVector(forward, 8);
+    }
   }
 
   // --- Survivors ------------------------------------------------------------
@@ -177,7 +227,7 @@ export class Entities {
     // convention its yaw comes from; +Z would aim every torch backwards.
     coneGeo.rotateX(Math.PI / 2);
     const cone = new THREE.Mesh(coneGeo, new THREE.MeshBasicMaterial({
-      vertexColors: true, transparent: true, opacity: 0.05,
+      vertexColors: true, transparent: true, opacity: 0.11,
       blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.FrontSide,
     }));
     cone.position.set(0, 1.5, 0);
@@ -331,7 +381,8 @@ export class Entities {
     // A dim red bounce light while hunting: enough to catch a wall edge behind
     // it and tell you something is there before you see it.
     let aura = null;
-    if (this.quality !== 'low') {
+    // One more per-pixel light for a mood cue: worth it only on high.
+    if (this.quality === 'high') {
       aura = new THREE.PointLight(0xff2a12, 0, 7, 2.0);
       aura.position.set(0, 1.6, 0);
       group.add(aura);

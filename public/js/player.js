@@ -37,6 +37,15 @@ export function moveVector(axis, yaw) {
   };
 }
 
+// Largest mouse delta accepted from one event, and from one frame's worth of
+// accumulated events. Both are far above any real flick at normal sensitivity.
+const MAX_MOVE_PER_EVENT = 260;
+const MAX_LOOK_PER_FRAME = 700;
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const clampDelta = (v) =>
+  (Number.isFinite(v) ? clamp(v, -MAX_MOVE_PER_EVENT, MAX_MOVE_PER_EVENT) : 0);
+
 export class Input {
   constructor(canvas) {
     this.canvas = canvas;
@@ -45,6 +54,7 @@ export class Input {
     this.mouseDY = 0;
     this.locked = false;
     this.sensitivity = 1;
+    this.swallowNextMove = false;
     this.captureText = false;      // true while the chat box has focus
     this.onLockChange = null;
 
@@ -59,12 +69,23 @@ export class Input {
 
     document.addEventListener('mousemove', (e) => {
       if (!this.locked) return;
-      this.mouseDX += e.movementX || 0;
-      this.mouseDY += e.movementY || 0;
+      // Browsers report one enormous movementX/Y on the first event after
+      // pointer lock engages - the jump from the cursor's old screen position.
+      // Acting on it whips the camera round, so the first event is dropped.
+      if (this.swallowNextMove) { this.swallowNextMove = false; return; }
+
+      // Clamp per event as well: a dropped frame or an alt-tab can otherwise
+      // deliver a single delta worth several full turns.
+      this.mouseDX += clampDelta(e.movementX);
+      this.mouseDY += clampDelta(e.movementY);
     });
 
     document.addEventListener('pointerlockchange', () => {
       this.locked = document.pointerLockElement === this.canvas;
+      // Never carry motion across a lock change, in either direction.
+      this.mouseDX = 0;
+      this.mouseDY = 0;
+      this.swallowNextMove = this.locked;
       if (!this.locked) this.keys.clear();
       if (this.onLockChange) this.onLockChange(this.locked);
     });
@@ -80,8 +101,13 @@ export class Input {
   down(code) { return this.keys.has(code); }
 
   // Consume accumulated mouse movement for this frame.
+  //
+  // Deltas pile up between frames, so a long hitch would otherwise apply every
+  // event at once and snap the view somewhere else entirely. Cap what a single
+  // frame can turn; anything beyond that is a stall artefact, not intent.
   takeLook() {
-    const dx = this.mouseDX, dy = this.mouseDY;
+    const dx = clamp(this.mouseDX, -MAX_LOOK_PER_FRAME, MAX_LOOK_PER_FRAME);
+    const dy = clamp(this.mouseDY, -MAX_LOOK_PER_FRAME, MAX_LOOK_PER_FRAME);
     this.mouseDX = 0; this.mouseDY = 0;
     return { dx, dy };
   }

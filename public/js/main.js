@@ -18,6 +18,10 @@ import { Input, LocalPlayer } from './player.js';
 // make out a wall edge two metres away, nowhere near enough to navigate by.
 const AMBIENT_BASE = 0.5;
 
+// Never drop below this fraction of a device pixel per screen pixel: past
+// here the picture is mush and the game stops being readable in the dark.
+const MIN_RENDER_SCALE = 0.55;
+
 const HOLD_TIME = { fuse: 0.9, insert: 1.9, revive: 3.6, exit: 1.4 };
 const REACH = { fuse: 2.6, insert: 3.4, revive: 2.6, exit: 4.0 };
 
@@ -126,6 +130,7 @@ class Game {
   resize() {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
+    if (this.renderScale) this.renderer.setPixelRatio(this.renderScale);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
   }
 
@@ -443,6 +448,7 @@ class Game {
   frame() {
     const dt = Math.min(0.1, this.clock.getDelta());
     this.hud.tick(dt);
+    this.adaptResolution(dt);
 
     if (this.phase === 'playing') this.updatePlaying(dt);
     else if (this.phase === 'ended') this.updateEnded(dt);
@@ -450,11 +456,41 @@ class Game {
     this.renderer.render(this.scene, this.camera);
   }
 
+// Scale the render resolution to hit the frame budget.
+  //
+  // This scene is fill-rate bound - several per-pixel lights and a shadow map -
+  // so pixels are what a weak GPU runs out of first. Rather than asking players
+  // to find the graphics setting, watch the frame time and quietly trade
+  // resolution for smoothness, then give it back when there is headroom.
+  adaptResolution(dt) {
+    if (this.phase !== 'playing') return;
+
+    // Exponential moving average: one slow frame should not trigger a change.
+    this.frameAvg = this.frameAvg === undefined ? dt : this.frameAvg * 0.92 + dt * 0.08;
+    this.resCooldown = (this.resCooldown ?? 0) - dt;
+    if (this.resCooldown > 0) return;
+
+    const cap = Math.min(window.devicePixelRatio, this.settings.quality === 'low' ? 1 : 1.5);
+    const current = this.renderScale ?? cap;
+    let next = current;
+
+    if (this.frameAvg > 1 / 40) next = current - 0.15;        // under 40 fps: back off
+    else if (this.frameAvg < 1 / 58 && current < cap) next = current + 0.1;
+
+    next = Math.max(MIN_RENDER_SCALE, Math.min(cap, next));
+    if (Math.abs(next - current) < 0.02) return;
+
+    this.renderScale = next;
+    this.resCooldown = 1.5;   // resizing the drawing buffer is not free either
+    this.renderer.setPixelRatio(next);
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
   updateEnded(dt) {
     this.endCountdown -= dt;
     this.hud.setEndCountdown(Math.ceil(this.endCountdown));
     // Keep the world drifting behind the results card rather than freezing.
-    this.entities.update(dt, this.localId);
+    this.entities.update(dt, this.localId, this.camera.position);
     this.world.update(dt, this.camera.position, this.powered, this.exitOpen);
   }
 
@@ -464,14 +500,20 @@ class Game {
 
     if (this.player.state === PLAYER_STATE.DEAD) this.spectate(dt);
 
-    this.entities.update(dt, this.localId);
+    this.entities.update(dt, this.localId, this.camera.position);
     this.world.update(dt, this.player.position, this.powered, this.exitOpen);
 
     const threat = this.entities.nearestMonster(this.player.position);
     this.updateFear(dt, threat);
     this.updateInteraction(dt);
     this.updateAudio(dt, threat);
-    this.updateHud(dt);
+    // The HUD is text and bars; refreshing it ten times a second is plenty
+    // and keeps DOM work out of the frame budget.
+    this.hudTimer = (this.hudTimer ?? 0) - dt;
+    if (this.hudTimer <= 0) {
+      this.hudTimer = 0.1;
+      this.updateHud(dt);
+    }
 
     this.net.sendInput(this.player.position, this.player.yaw, this.player.flags());
   }

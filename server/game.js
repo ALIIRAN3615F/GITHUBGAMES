@@ -27,6 +27,10 @@ const MAX_PLAYERS = 8;
 // clamps against them so a tampered client cannot outrun the monster.
 const SPEED = { walk: 3.2, sprint: 5.6, crouch: 1.65 };
 
+// The monster's collision radius. Narrower than its reach, so it can still
+// follow a one-cell corridor without grinding along both walls.
+const MONSTER_RADIUS = 0.4;
+
 const DIFFICULTY = {
   calm:      { patrol: 2.0, chase: 4.05, hearing: 17, sight: 17, grace: 40, bleed: 60, monsters: 1, label: 'Calm' },
   normal:    { patrol: 2.4, chase: 4.70, hearing: 23, sight: 21, grace: 25, bleed: 45, monsters: 1, label: 'Normal' },
@@ -595,8 +599,14 @@ class Session {
       return;
     }
     const step = Math.min(d, speed * dt);
-    m.x += (dx / d) * step;
-    m.z += (dz / d) * step;
+    const nx = m.x + (dx / d) * step;
+    const nz = m.z + (dz / d) * step;
+    // It follows cell centres, but a re-path mid-stride used to let it cut the
+    // corner of a block. Push the body out of any rock it overlaps, exactly as
+    // players are pushed, so it hugs walls instead of passing through them.
+    const fixed = this.resolveCircle(nx, nz, MONSTER_RADIUS);
+    m.x = fixed.x;
+    m.z = fixed.z;
     const wanted = Math.atan2(dx, dz);
     m.yaw += angleDelta(m.yaw, wanted) * Math.min(1, dt * 6);
   }
@@ -633,6 +643,47 @@ class Session {
   cellCenter(cell) {
     const { w, h, cell: size } = this.map;
     return { x: (cell.cx - (w - 1) / 2) * size, z: (cell.cy - (h - 1) / 2) * size };
+  }
+
+// Push a circle out of any solid cell it overlaps. Kept deliberately in step
+  // with World.resolveCollision on the client so both ends agree on where a
+  // body can stand. Walls only: props are not in the monster's path graph, so
+  // colliding it against them would just wedge it against a crate.
+  resolveCircle(x, z, radius) {
+    const cell = this.map.cell;
+    const c = worldToCell(x, z, this.map.w, this.map.h);
+    let outX = x, outZ = z;
+
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const cx = c.cx + dx, cy = c.cy + dy;
+        if (cx < 0 || cy < 0 || cx >= this.map.w || cy >= this.map.h) continue;
+        if (this.grid[idx(cx, cy, this.map.w)] === 1) continue;
+
+        const center = this.cellCenter({ cx, cy });
+        const half = cell / 2;
+        const minX = center.x - half, maxX = center.x + half;
+        const minZ = center.z - half, maxZ = center.z + half;
+
+        const closestX = Math.max(minX, Math.min(outX, maxX));
+        const closestZ = Math.max(minZ, Math.min(outZ, maxZ));
+        const px = outX - closestX, pz = outZ - closestZ;
+        const distSq = px * px + pz * pz;
+        if (distSq >= radius * radius) continue;
+
+        if (distSq > 1e-8) {
+          const dist = Math.sqrt(distSq);
+          outX = closestX + (px / dist) * radius;
+          outZ = closestZ + (pz / dist) * radius;
+        } else {
+          const penX = Math.min(outX - minX, maxX - outX);
+          const penZ = Math.min(outZ - minZ, maxZ - outZ);
+          if (penX < penZ) outX = outX < center.x ? minX - radius : maxX + radius;
+          else outZ = outZ < center.z ? minZ - radius : maxZ + radius;
+        }
+      }
+    }
+    return { x: outX, z: outZ };
   }
 
   isSolidAt(x, z) {

@@ -11,7 +11,7 @@ import * as TEX from './textures.js';
 
 const QUALITY = {
   low:    { shadows: false, shadowSize: 512,  lampLights: 0, propDetail: false, anisotropy: 1 },
-  medium: { shadows: true,  shadowSize: 1024, lampLights: 3, propDetail: true,  anisotropy: 4 },
+  medium: { shadows: true,  shadowSize: 1024, lampLights: 2, propDetail: true,  anisotropy: 4 },
   high:   { shadows: true,  shadowSize: 2048, lampLights: 5, propDetail: true,  anisotropy: 8 },
 };
 
@@ -25,6 +25,8 @@ export class World {
     this.lamps = [];
     this.lampLights = [];
     this.disposables = [];
+    this.obstacles = [];
+    this.obstacleBuckets = new Map();
     this.map = null;
     this.grid = null;
     this.powered = 0;
@@ -40,6 +42,7 @@ export class World {
     this.root = new THREE.Group();
     this.scene.add(this.root);
 
+    this.indexObstacles(map.obstacles || []);
     this.materials = this.makeMaterials();
     this.buildShell();
     this.buildWalls();
@@ -430,6 +433,26 @@ export class World {
 
   // --- Queries -------------------------------------------------------------
 
+// Bucket the solid props by cell so collision only ever tests the handful
+  // within reach, rather than every crate in the facility.
+  indexObstacles(obstacles) {
+    this.obstacles = obstacles;
+    this.obstacleBuckets = new Map();
+    for (const o of obstacles) {
+      const c = this.worldToCell(o.x, o.z);
+      // A prop can overhang into a neighbouring cell, so register it in each
+      // cell its radius touches.
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const key = (c.cx + dx) + ',' + (c.cy + dy);
+          let list = this.obstacleBuckets.get(key);
+          if (!list) { list = []; this.obstacleBuckets.set(key, list); }
+          list.push(o);
+        }
+      }
+    }
+  }
+
   cellToWorld(cx, cy) {
     const { w, h, cell } = this.map;
     return { x: (cx - (w - 1) / 2) * cell, z: (cy - (h - 1) / 2) * cell };
@@ -451,9 +474,25 @@ export class World {
     return this.isSolidCell(c.cx, c.cy);
   }
 
-  // Push a circle out of any solid cell it overlaps. Axis-separated so sliding
-  // along a wall feels smooth instead of catching on every cell boundary.
+  // Resolve a circle against the level: rock first, then props.
+  //
+  // The two constraints have to be satisfied together. Doing one pass of each
+  // let the prop push-out undo the wall push-out and deposit the player inside
+  // rock, so iterate until the position stops moving. Realistic layouts settle
+  // in one or two passes; the cap stops a pathological corner from spinning.
   resolveCollision(x, z, radius) {
+    let outX = x, outZ = z;
+    for (let pass = 0; pass < 4; pass++) {
+      const prevX = outX, prevZ = outZ;
+      ({ x: outX, z: outZ } = this.pushOutOfWalls(outX, outZ, radius));
+      ({ x: outX, z: outZ } = this.pushOutOfProps(outX, outZ, radius));
+      if (Math.abs(outX - prevX) < 1e-6 && Math.abs(outZ - prevZ) < 1e-6) break;
+    }
+    return { x: outX, z: outZ };
+  }
+
+  // Circle against the axis-aligned boxes of the solid cells around it.
+  pushOutOfWalls(x, z, radius) {
     const { cell } = this.map;
     const c = this.worldToCell(x, z);
     let outX = x, outZ = z;
@@ -489,6 +528,29 @@ export class World {
     return { x: outX, z: outZ };
   }
 
+  // Circle against the crates, barrels, lockers and the generator housing.
+  pushOutOfProps(x, z, radius) {
+    let outX = x, outZ = z;
+    const here = this.worldToCell(outX, outZ);
+    const near = this.obstacleBuckets.get(here.cx + ',' + here.cy);
+    if (!near) return { x: outX, z: outZ };
+
+    for (const o of near) {
+      const dx = outX - o.x, dz = outZ - o.z;
+      const min = o.r + radius;
+      const distSq = dx * dx + dz * dz;
+      if (distSq >= min * min) continue;
+      if (distSq > 1e-8) {
+        const dist = Math.sqrt(distSq);
+        outX = o.x + (dx / dist) * min;
+        outZ = o.z + (dz / dist) * min;
+      } else {
+        outX = o.x + min;   // exactly concentric: shove along +X
+      }
+    }
+    return { x: outX, z: outZ };
+  }
+
   dispose() {
     if (this.root) this.scene.remove(this.root);
     for (const d of this.disposables) { try { d.dispose(); } catch { /* not disposable */ } }
@@ -496,6 +558,8 @@ export class World {
     this.lamps = [];
     this.lampLights = [];
     this.fuseSlots = [];
+    this.obstacles = [];
+    this.obstacleBuckets = new Map();
     this.root = new THREE.Group();
   }
 }

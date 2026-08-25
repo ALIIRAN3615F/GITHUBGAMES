@@ -89,7 +89,26 @@ function generate(opts = {}) {
     props,
     lamps,
     fuseCount,
+    // Circular footprints players must walk around. Derived here, not on the
+    // client, so both ends collide against identical numbers.
+    obstacles: buildObstacles(props, genCell, w, h),
   };
+}
+
+// Props with a footprint, plus the generator housing. The exit door is left
+// passable on purpose - you walk into it to escape.
+function buildObstacles(props, genCell, w, h) {
+  const out = [];
+  for (const p of props) {
+    const base = PROP_RADIUS[p.t];
+    if (!base) continue;
+    out.push({ x: p.x, z: p.z, r: +(base * (p.s || 1)).toFixed(2) });
+  }
+  const gen = cellToWorld(genCell.cx, genCell.cy, w, h);
+  // Generator body is 2.1 x 1.2; a 1.15 circle keeps players off it while
+  // still letting them reach the fuse slots.
+  out.push({ x: +gen.x.toFixed(2), z: +gen.z.toFixed(2), r: 1.15 });
+  return out;
 }
 
 function worldPoint(cell, w, h) {
@@ -250,6 +269,13 @@ function ringCells(grid, w, h, center, max) {
 }
 
 // --- Dressing --------------------------------------------------------------
+
+// Solid footprint radius per prop type. Anything absent from this table is
+// decoration you can walk over (decals, corpses, wall vents, signs).
+const PROP_RADIUS = {
+  crate: 0.48, barrel: 0.38, locker: 0.44, shelf: 0.5,
+  table: 0.6, chair: 0.3, gurney: 0.55, pipes: 0.18,
+};
 
 const WALL_PROPS = ['locker', 'shelf', 'pipes', 'vent', 'sign'];
 const FLOOR_PROPS = ['crate', 'barrel', 'debris', 'table', 'chair', 'gurney'];

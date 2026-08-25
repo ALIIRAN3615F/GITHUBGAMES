@@ -138,8 +138,13 @@ Node 16+ on the host machine. Headphones are strongly recommended: the audio is
 positional, and knowing which corridor a sound came from is the difference between
 getting out and not.
 
-If the frame rate struggles, drop **Graphics** to Low in the pause menu (`Esc`); it
-turns off shadows and the secondary lights, which is where nearly all the cost is.
+The game watches its own frame time and quietly lowers render resolution when it
+cannot hold ~40 fps, restoring it when there is headroom again, so a weaker machine
+degrades in sharpness rather than in smoothness. If it still struggles, drop
+**Graphics** to Low in the pause menu (`Esc`): that turns off shadows, the ceiling
+lamps and other players' torch lights, which is where nearly all the remaining cost
+is. The scene itself is cheap — a whole maze is one instanced draw call — so the
+limit is per-pixel lighting, which is exactly what resolution trades against.
 
 ## License
 

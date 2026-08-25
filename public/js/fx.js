@@ -14,10 +14,11 @@ export class Fx {
     this.scanline = document.getElementById('scanline');
     this.canvas = document.getElementById('scene');
 
-    // A handful of pre-rendered noise tiles, cycled: cheaper than regenerating
-    // and far less regular than scrolling a single tile.
-    this.frames = [];
-    for (let i = 0; i < 4; i++) this.frames.push(noiseDataURL(180));
+    // One noise tile, applied once. Swapping between several data URIs forced
+    // the compositor to decode an image every few frames, which showed up as
+    // steady frame-time cost on weak GPUs; jittering the offset of a single
+    // tile looks the same and costs nothing.
+    this.grain.style.backgroundImage = `url(${noiseDataURL(180)})`;
     this.frameIndex = 0;
     this.grainTimer = 0;
     this.flashTimer = 0;
@@ -33,13 +34,16 @@ export class Fx {
       // rather than film, any slower reads as a static overlay.
       this.grainTimer -= dt;
       if (this.grainTimer <= 0) {
-        this.grainTimer = 0.055;
-        this.frameIndex = (this.frameIndex + 1) % this.frames.length;
-        this.grain.style.backgroundImage = `url(${this.frames[this.frameIndex]})`;
+        this.grainTimer = 0.06;
+        // Transform-only: composited on the GPU, no repaint, no decode.
         this.grain.style.transform =
-          `translate(${(Math.random() * 8 - 4).toFixed(1)}px, ${(Math.random() * 8 - 4).toFixed(1)}px)`;
+          `translate3d(${(Math.random() * 40 - 20).toFixed(1)}px, ${(Math.random() * 40 - 20).toFixed(1)}px, 0)`;
+        const opacity = (0.035 + nerve * 0.075).toFixed(3);
+        if (opacity !== this.lastGrainOpacity) {
+          this.lastGrainOpacity = opacity;
+          this.grain.style.opacity = opacity;
+        }
       }
-      this.grain.style.opacity = (0.035 + nerve * 0.075).toFixed(3);
     }
 
     this.vignette.classList.toggle('fear', nerve > 0.62);

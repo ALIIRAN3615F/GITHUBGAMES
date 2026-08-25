@@ -209,11 +209,22 @@ export class Hud {
 
   // --- In-game --------------------------------------------------------------
 
+  // Every setter below is called from the frame loop, so each one skips the
+  // DOM write when the value has not actually changed. Layout and style
+  // recalculation was costing more than the rendering on weak machines.
   setMeters(stamina, battery) {
-    this.el.staminaFill.style.transform = `scaleX(${Math.max(0, stamina) / 100})`;
-    this.el.batteryFill.style.transform = `scaleX(${Math.max(0, battery) / 100})`;
-    this.el.staminaFill.classList.toggle('low', stamina < 25);
-    this.el.batteryFill.classList.toggle('low', battery < 20);
+    const s = Math.round(Math.max(0, stamina));
+    const b = Math.round(Math.max(0, battery));
+    if (s !== this.lastStamina) {
+      this.lastStamina = s;
+      this.el.staminaFill.style.transform = `scaleX(${s / 100})`;
+      this.el.staminaFill.classList.toggle('low', s < 25);
+    }
+    if (b !== this.lastBattery) {
+      this.lastBattery = b;
+      this.el.batteryFill.style.transform = `scaleX(${b / 100})`;
+      this.el.batteryFill.classList.toggle('low', b < 20);
+    }
   }
 
   setObjective(text, urgent = false) {
@@ -231,10 +242,25 @@ export class Hud {
     for (let i = 0; i < pips.length; i++) pips[i].classList.toggle('on', i < powered);
   }
 
-  setCarrying(carrying) { this.el.carrying.hidden = !carrying; }
-  setPing(ms) { this.el.pingVal.textContent = String(ms); }
+  setCarrying(carrying) {
+    if (carrying === this.lastCarrying) return;
+    this.lastCarrying = carrying;
+    this.el.carrying.hidden = !carrying;
+  }
+
+  setPing(ms) {
+    if (ms === this.lastPing) return;
+    this.lastPing = ms;
+    this.el.pingVal.textContent = String(ms);
+  }
 
   updateRoster(players, localId) {
+    // Rebuilding this markup every frame reparsed HTML 60 times a second for
+    // a panel that changes a few times a round.
+    const signature = players.map((p) => `${p.id}:${p.state}:${p.carrying ? 1 : 0}:${p.downTimer}`).join('|');
+    if (signature === this.lastRoster) return;
+    this.lastRoster = signature;
+
     const rows = players.map((p) => {
       const cls = 'roster-row ' + STATE_NAME[p.state];
       const you = p.id === localId ? ' *' : '';
