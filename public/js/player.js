@@ -23,6 +23,20 @@ const STAMINA_MIN_TO_SPRINT = 9;
 const BATTERY_DRAIN = 1.15;
 const BATTERY_REGEN = 0.5;
 
+// Turn WASD axes into a world-space direction for a given yaw.
+//
+// three rotates about Y as [x' = x cos + z sin, z' = -x sin + z cos], which is
+// the opposite handedness to the textbook 2D rotation. Using the textbook form
+// mirrors movement about the Z axis: forward is only correct when facing due
+// north or south, and veers off sideways at every other angle.
+export function moveVector(axis, yaw) {
+  const sin = Math.sin(yaw), cos = Math.cos(yaw);
+  return {
+    x: axis.x * cos + axis.z * sin,
+    z: -axis.x * sin + axis.z * cos,
+  };
+}
+
 export class Input {
   constructor(canvas) {
     this.canvas = canvas;
@@ -208,15 +222,12 @@ export class LocalPlayer {
       : this.sprinting ? SPEED.sprint
       : SPEED.walk;
 
-    const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
-    // Camera-relative: forward is -Z rotated by yaw.
-    const wishX = axis.x * cos - axis.z * sin;
-    const wishZ = axis.x * sin + axis.z * cos;
+    const wish = moveVector(axis, this.yaw);
 
     const accel = 42;
     const friction = 12;
-    this.velocity.x += (wishX * speed - this.velocity.x) * Math.min(1, accel * dt / Math.max(speed, 0.001));
-    this.velocity.z += (wishZ * speed - this.velocity.z) * Math.min(1, accel * dt / Math.max(speed, 0.001));
+    this.velocity.x += (wish.x * speed - this.velocity.x) * Math.min(1, accel * dt / Math.max(speed, 0.001));
+    this.velocity.z += (wish.z * speed - this.velocity.z) * Math.min(1, accel * dt / Math.max(speed, 0.001));
     if (!axis.x && !axis.z) {
       const damp = Math.max(0, 1 - friction * dt);
       this.velocity.x *= damp;

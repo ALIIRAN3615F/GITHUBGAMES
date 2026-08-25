@@ -167,13 +167,15 @@ export class Entities {
     const pos = coneGeo.attributes.position;
     const shade = new Float32Array(pos.count * 3);
     for (let i = 0; i < pos.count; i++) {
-      const t = (pos.getY(i) + 3.5) / 7;          // 0 at the tip, 1 at the mouth
+      const t = (pos.getY(i) + 3.5) / 7;          // 1 at the apex, 0 at the mouth
       const v = Math.pow(t, 2.2);
       shade[i * 3] = v; shade[i * 3 + 1] = v * 0.92; shade[i * 3 + 2] = v * 0.74;
     }
     coneGeo.setAttribute('color', new THREE.BufferAttribute(shade, 3));
     coneGeo.translate(0, -3.5, 0);
-    coneGeo.rotateX(-Math.PI / 2);
+    // Lay the beam along local -Z so the avatar's forward matches the camera
+    // convention its yaw comes from; +Z would aim every torch backwards.
+    coneGeo.rotateX(Math.PI / 2);
     const cone = new THREE.Mesh(coneGeo, new THREE.MeshBasicMaterial({
       vertexColors: true, transparent: true, opacity: 0.05,
       blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.FrontSide,
@@ -186,7 +188,7 @@ export class Entities {
       opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending,
     }));
     halo.scale.set(1.1, 1.1, 1);
-    halo.position.set(0, 1.5, 0.2);
+    halo.position.set(0, 1.5, -0.2);
     halo.visible = false;
 
     const label = this.makeNameTag(info ? info.name : 'Survivor', color);

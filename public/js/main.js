@@ -301,9 +301,10 @@ class Game {
   bestFacing(spawn) {
     const cell = this.world.worldToCell(spawn.x, spawn.z);
     const dirs = [
-      { dx: 0, dy: -1, yaw: Math.PI },
+      // A camera looks down its local -Z, so yaw 0 faces -Z (grid north).
+      { dx: 0, dy: -1, yaw: 0 },
       { dx: 1, dy: 0, yaw: -Math.PI / 2 },
-      { dx: 0, dy: 1, yaw: 0 },
+      { dx: 0, dy: 1, yaw: Math.PI },
       { dx: -1, dy: 0, yaw: Math.PI / 2 },
     ];
     let best = dirs[0], bestRun = -1;
