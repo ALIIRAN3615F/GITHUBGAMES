@@ -9,6 +9,10 @@ import * as THREE from '../vendor/three.module.js';
 import * as TEX from './textures.js';
 
 const INTERP_DELAY = 110;    // ms
+
+// Brightness of another player's flashlight. Slightly under your own, so your
+// beam still reads as yours, but bright enough to light a room for you.
+const FLASHLIGHT_INTENSITY = 12;
 const BUFFER_MAX = 24;
 
 export const MONSTER_STATE = { DORMANT: 0, PATROL: 1, IDLE: 2, HUNT: 3, CHASE: 4, RETREAT: 5 };
@@ -35,11 +39,11 @@ export class Entities {
     this.nameCache = new Map();
     this.time = 0;
 
-    // Other players' torches have to actually light the room - a translucent
+    // Other players' flashlights have to actually light the room - a translucent
     // cone alone reads as a bug. Real spotlights are expensive, so a small pool
-    // is shared out to the nearest torch-bearers each frame. No shadows: the
+    // is shared out to the nearest flashlight-bearers each frame. No shadows: the
     // shadow map is what costs, not the light.
-    this.torchPool = [];
+    this.flashlightPool = [];
     const poolSize = quality === 'low' ? 0 : quality === 'high' ? 3 : 2;
     for (let i = 0; i < poolSize; i++) {
       const light = new THREE.SpotLight(0xffe8c4, 0, 26, 0.5, 0.62, 1.25);
@@ -48,12 +52,62 @@ export class Entities {
       const target = new THREE.Object3D();
       this.root.add(light, target);
       light.target = target;
-      this.torchPool.push({ light, target });
+      this.flashlightPool.push({ light, target });
     }
   }
 
+  // Batteries are static world objects whose only state is taken/not taken, so
+  // they are drawn as a single instanced mesh and hidden by zeroing the scale
+  // of a taken instance. 24 pickups therefore cost one draw call, not 24.
+  setMap(map) {
+    if (this.batteryMesh) {
+      this.root.remove(this.batteryMesh);
+      this.batteryMesh.geometry.dispose();
+      this.batteryMesh = null;
+    }
+    this.batteryPoints = map.batteries || [];
+    if (!this.batteryPoints.length) return;
+
+    const cellGeo = new THREE.CylinderGeometry(0.055, 0.055, 0.2, 8);
+    const capGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.04, 8);
+    capGeo.translate(0, 0.12, 0);
+    const geo = mergeSimple([cellGeo, capGeo]);
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x2f6b4a, roughness: 0.45, metalness: 0.6,
+      emissive: 0x27c07a, emissiveIntensity: 0.55,
+    });
+    const mesh = new THREE.InstancedMesh(geo, mat, this.batteryPoints.length);
+    mesh.frustumCulled = false;
+    this.batteryMesh = mesh;
+    this.batteryMatrix = new THREE.Matrix4();
+    this.root.add(mesh);
+    this.syncBatteries(null);
+  }
+
+  // Hide collected batteries by collapsing the instance to nothing.
+  syncBatteries(rows) {
+    if (!this.batteryMesh) return;
+    const taken = new Set();
+    for (const row of rows || []) if (row[3]) taken.add(row[0]);
+    this.takenBatteries = taken;
+
+    const m = this.batteryMatrix;
+    this.batteryPoints.forEach((b, i) => {
+      if (taken.has(b.id)) {
+        m.makeScale(0, 0, 0);
+      } else {
+        const bob = Math.sin(this.time * 1.5 + b.id) * 0.05;
+        m.makeRotationY(this.time * 0.7 + b.id);
+        m.setPosition(b.x, 0.42 + bob, b.z);
+      }
+      this.batteryMesh.setMatrixAt(i, m);
+    });
+    this.batteryMesh.instanceMatrix.needsUpdate = true;
+  }
+
   reset() {
-    for (const slot of this.torchPool) { slot.light.visible = false; slot.light.intensity = 0; }
+    for (const slot of this.flashlightPool) { slot.light.visible = false; slot.light.intensity = 0; }
     for (const map of [this.players, this.monsters, this.fuses]) {
       for (const e of map.values()) this.root.remove(e.group);
       map.clear();
@@ -97,12 +151,13 @@ export class Entities {
     this.syncPlayers(s, localId, dt);
     this.syncMonsters(s, dt);
     this.syncFuses(s, dt);
-    this.assignTorches(viewerPos);
+    this.syncBatteries(s.b.b);
+    this.assignFlashlights(viewerPos);
   }
 
-  // Hand the light pool to the nearest teammates whose torch is on.
-  assignTorches(viewerPos) {
-    if (!this.torchPool.length) return;
+  // Hand the light pool to the nearest teammates whose flashlight is on.
+  assignFlashlights(viewerPos) {
+    if (!this.flashlightPool.length) return;
 
     const lit = [];
     for (const entity of this.players.values()) {
@@ -115,20 +170,25 @@ export class Entities {
     }
     lit.sort((a, b) => a.d - b.d);
 
-    for (let i = 0; i < this.torchPool.length; i++) {
-      const slot = this.torchPool[i];
+    for (let i = 0; i < this.flashlightPool.length; i++) {
+      const slot = this.flashlightPool[i];
       const owner = lit[i];
       if (!owner) { slot.light.visible = false; slot.light.intensity = 0; continue; }
 
       const g = owner.entity.group;
-      // The avatar's forward is local -Z, matching the camera convention its
-      // yaw came from.
-      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(g.quaternion);
+      // Compose yaw and pitch the same way the owner's camera does (rotateY
+      // then rotateX, i.e. YXZ), so the beam points where they are actually
+      // looking rather than always sitting level.
+      const euler = new THREE.Euler(owner.entity.data.pitch || 0, g.rotation.y, 0, 'YXZ');
+      const forward = new THREE.Vector3(0, 0, -1).applyEuler(euler);
+
       slot.light.visible = true;
-      slot.light.intensity = 11;
+      slot.light.intensity = FLASHLIGHT_INTENSITY;
+      // Cast from the lens, not from the middle of the body, or the beam
+      // starts inside their own chest.
       slot.light.position.set(g.position.x, g.position.y + 1.5, g.position.z);
-      slot.light.position.addScaledVector(forward, 0.25);
-      slot.target.position.copy(slot.light.position).addScaledVector(forward, 8);
+      slot.light.position.addScaledVector(forward, 0.35);
+      slot.target.position.copy(slot.light.position).addScaledVector(forward, 10);
     }
   }
 
@@ -151,16 +211,21 @@ export class Entities {
         this.root.add(entity.group);
       }
 
+      // Row: [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
       const x = lerp(rowA[1], rowB[1], s.alpha);
       const z = lerp(rowA[3], rowB[3], s.alpha);
       const yaw = lerpAngle(rowA[4], rowB[4], s.alpha);
-      const flags = rowB[5];
-      const state = rowB[6];
-      const carrying = rowB[7] >= 0;
+      const pitch = lerp(rowA[5], rowB[5], s.alpha);
+      const flags = rowB[6];
+      const state = rowB[7];
+      const carrying = rowB[8] >= 0;
 
       entity.group.position.set(x, 0, z);
       entity.group.rotation.y = yaw;
-      entity.data = { flags, state, carrying, downTimer: rowB[8] };
+      entity.data = {
+        flags, state, carrying, pitch,
+        downTimer: rowB[9], charge: rowB[10], reserve: rowB[11],
+      };
       this.animateSurvivor(entity, dt, flags, state);
     }
 
@@ -187,7 +252,7 @@ export class Entities {
     head.position.y = 1.56;
 
     // Shoulder flash in the player's colour - the only way to tell each other
-    // apart when all you have is a torch beam.
+    // apart when all you have is a flashlight beam.
     const band = new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.035, 6, 14), accent);
     band.rotation.x = Math.PI / 2;
     band.position.y = 1.28;
@@ -208,46 +273,25 @@ export class Entities {
     const armR = armL.clone();
     armR.position.x = 0.29;
 
-    // Their torch, drawn as a translucent cone rather than a real light: eight
-    // shadow-casting spotlights would halve the frame rate for no gain.
-    const coneGeo = new THREE.ConeGeometry(1.4, 7, 14, 1, true);
-    // Vertex colours fade the shaft to black along its length; under additive
-    // blending black is invisible, so the beam dissolves instead of ending in a
-    // hard rim.
-    const pos = coneGeo.attributes.position;
-    const shade = new Float32Array(pos.count * 3);
-    for (let i = 0; i < pos.count; i++) {
-      const t = (pos.getY(i) + 3.5) / 7;          // 1 at the apex, 0 at the mouth
-      const v = Math.pow(t, 2.2);
-      shade[i * 3] = v; shade[i * 3 + 1] = v * 0.92; shade[i * 3 + 2] = v * 0.74;
-    }
-    coneGeo.setAttribute('color', new THREE.BufferAttribute(shade, 3));
-    coneGeo.translate(0, -3.5, 0);
-    // Lay the beam along local -Z so the avatar's forward matches the camera
-    // convention its yaw comes from; +Z would aim every torch backwards.
-    coneGeo.rotateX(Math.PI / 2);
-    const cone = new THREE.Mesh(coneGeo, new THREE.MeshBasicMaterial({
-      vertexColors: true, transparent: true, opacity: 0.11,
-      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.FrontSide,
-    }));
-    cone.position.set(0, 1.5, 0);
-    cone.visible = false;
-
+    // No beam geometry on the avatar. A long cone mesh reads as a solid object
+    // jutting out of the player rather than as light; the illumination comes
+    // from a real spotlight in the shared pool. All that is drawn here is the
+    // lens itself glowing, so you can tell at a glance whose light is on.
     const halo = new THREE.Sprite(new THREE.SpriteMaterial({
       map: this.glowTex, color: 0xffd9a0, transparent: true,
-      opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending,
+      opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending,
     }));
-    halo.scale.set(1.1, 1.1, 1);
-    halo.position.set(0, 1.5, -0.2);
+    halo.scale.set(0.9, 0.9, 1);
+    halo.position.set(0, 1.5, -0.28);
     halo.visible = false;
 
     const label = this.makeNameTag(info ? info.name : 'Survivor', color);
     label.position.y = 2.05;
 
-    group.add(torso, head, band, legL, legR, armL, armR, cone, halo, label);
+    group.add(torso, head, band, legL, legR, armL, armR, halo, label);
     return {
       group,
-      parts: { torso, head, band, legL, legR, armL, armR, cone, halo, label },
+      parts: { torso, head, band, legL, legR, armL, armR, halo, label },
       phase: Math.random() * 10,
       data: {},
     };
@@ -260,8 +304,7 @@ export class Entities {
     const crouch = (flags & FLAG.CROUCH) !== 0;
     const light = (flags & FLAG.LIGHT) !== 0;
 
-    parts.cone.visible = light && state === PLAYER_STATE.ALIVE;
-    parts.halo.visible = parts.cone.visible;
+    parts.halo.visible = light && state === PLAYER_STATE.ALIVE;
 
     if (state === PLAYER_STATE.DOWN) {
       // Collapsed on their side, one arm up. Unmistakable from a distance.
@@ -324,7 +367,7 @@ export class Entities {
   }
 
   // Tall, starved, wrong proportions: long arms, short torso, a head that hangs
-  // too low. Almost black so the torch only ever catches parts of it.
+  // too low. Almost black so the flashlight only ever catches parts of it.
   makeMonster() {
     const group = new THREE.Group();
     const skin = new THREE.MeshStandardMaterial({ color: 0x2e2f33, roughness: 0.94, metalness: 0.05 });
@@ -533,6 +576,11 @@ export class Entities {
   // Everything the local player could interact with right now.
   interactables() {
     const out = [];
+    for (const b of this.batteryPoints || []) {
+      if (!this.takenBatteries || !this.takenBatteries.has(b.id)) {
+        out.push({ kind: 'battery', id: b.id, x: b.x, z: b.z });
+      }
+    }
     for (const f of this.fuses.values()) {
       if (f.data.state === 0) out.push({ kind: 'fuse', id: f.data.id, x: f.data.x, z: f.data.z });
     }
@@ -563,4 +611,38 @@ function lerpAngle(a, b, t) {
   if (d > Math.PI) d -= Math.PI * 2;
   if (d < -Math.PI) d += Math.PI * 2;
   return a + d * t;
+}
+
+// Minimal geometry merge for the battery pickup: two cylinders into one buffer
+// so every battery in the level is a single instanced draw.
+function mergeSimple(geoms) {
+  let verts = 0, indices = 0;
+  for (const g of geoms) {
+    verts += g.attributes.position.count;
+    indices += g.index ? g.index.count : g.attributes.position.count;
+  }
+  const position = new Float32Array(verts * 3);
+  const normal = new Float32Array(verts * 3);
+  const uv = new Float32Array(verts * 2);
+  const index = new Uint16Array(indices);
+
+  let vo = 0, io = 0;
+  for (const g of geoms) {
+    position.set(g.attributes.position.array, vo * 3);
+    if (g.attributes.normal) normal.set(g.attributes.normal.array, vo * 3);
+    if (g.attributes.uv) uv.set(g.attributes.uv.array, vo * 2);
+    const src = g.index ? g.index.array : null;
+    const count = src ? src.length : g.attributes.position.count;
+    for (let i = 0; i < count; i++) index[io + i] = (src ? src[i] : i) + vo;
+    io += count;
+    vo += g.attributes.position.count;
+    g.dispose();
+  }
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(position, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
+  merged.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  merged.setIndex(new THREE.BufferAttribute(index, 1));
+  merged.computeBoundingSphere();
+  return merged;
 }

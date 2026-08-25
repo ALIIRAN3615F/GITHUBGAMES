@@ -12,6 +12,9 @@ const WALL_H = 3.4;    // wall height in world units
 
 const SIZES = { small: 23, medium: 31, large: 39 };
 
+// How many spare flashlight batteries are hidden in the facility.
+const BATTERY_COUNT = 24;
+
 function idx(x, y, w) { return y * w + x; }
 
 // Grid <-> world helpers. The map is centred on the origin.
@@ -34,6 +37,7 @@ function generate(opts = {}) {
   const size = SIZES[opts.size] || SIZES.medium;
   const w = size, h = size;
   const fuseCount = Math.max(3, Math.min(9, opts.fuseCount ?? 6));
+  const batteryCount = Math.max(0, Math.min(64, opts.batteryCount ?? BATTERY_COUNT));
 
   // 0 = solid rock, 1 = walkable floor.
   const grid = new Uint8Array(w * h);
@@ -63,6 +67,7 @@ function generate(opts = {}) {
   const exitCell = { cx: exitRoom.cx, cy: exitRoom.cy };
 
   const fuseCells = placeFuses(floors, distFromSpawn, w, maxDist, fuseCount, [spawnCell, genCell, exitCell], rng);
+  const batteryCells = placeBatteries(floors, batteryCount, [spawnCell, genCell, exitCell, ...fuseCells], rng);
 
   // --- Dressing ------------------------------------------------------------
   const props = placeProps(grid, w, h, rooms, rng, [spawnCell, genCell, exitCell]);
@@ -86,9 +91,11 @@ function generate(opts = {}) {
     generator: worldPoint(genCell, w, h),
     exit: worldPoint(exitCell, w, h),
     fuses: fuseCells.map((c, i) => ({ id: i, ...worldPoint(c, w, h) })),
+    batteries: batteryCells.map((c, i) => ({ id: i, ...worldPoint(c, w, h) })),
     props,
     lamps,
     fuseCount,
+    batteryCount: batteryCells.length,
     // Circular footprints players must walk around. Derived here, not on the
     // client, so both ends collide against identical numbers.
     obstacles: buildObstacles(props, genCell, w, h),
@@ -251,6 +258,28 @@ function placeFuses(floors, dist, w, maxDist, count, avoid, rng) {
   return chosen.slice(0, count);
 }
 
+// Batteries are the flashlight's ammunition, so they are spread far more
+// liberally than fuses: no distance requirement from the spawn, just enough
+// mutual spacing that they never cluster into one lucky pile.
+function placeBatteries(floors, count, avoid, rng) {
+  const candidates = floors.filter((c) =>
+    !avoid.some((a) => Math.abs(a.cx - c.cx) + Math.abs(a.cy - c.cy) < 2));
+  rng.shuffle(candidates);
+
+  const chosen = [];
+  let spacing = 5;
+  while (chosen.length < count && spacing >= 0) {
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      if (chosen.some((p) => Math.abs(p.cx - c.cx) + Math.abs(p.cy - c.cy) < spacing)) continue;
+      if (chosen.some((p) => p.cx === c.cx && p.cy === c.cy)) continue;
+      chosen.push(c);
+    }
+    spacing -= 1;   // relax until the map can hold them all
+  }
+  return chosen.slice(0, count);
+}
+
 function ringCells(grid, w, h, center, max) {
   const out = [];
   for (let r = 0; r <= 3 && out.length < max; r++) {
@@ -349,4 +378,4 @@ function placeLamps(grid, w, h, rooms, rng) {
   return lamps;
 }
 
-module.exports = { generate, cellToWorld, worldToCell, bfsDistances, CELL, WALL_H, SIZES, idx };
+module.exports = { generate, BATTERY_COUNT, cellToWorld, worldToCell, bfsDistances, CELL, WALL_H, SIZES, idx };

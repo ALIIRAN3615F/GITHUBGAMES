@@ -1,4 +1,4 @@
-// Local player: input, movement, torch, and the resources that make the game a
+// Local player: input, movement, flashlight, and the resources that make the game a
 // game (stamina, battery, nerve).
 //
 // The client simulates its own movement and tells the server where it ended up.
@@ -12,16 +12,17 @@ const SPEED = { walk: 3.2, sprint: 5.6, crouch: 1.65 };
 const RADIUS = 0.32;
 const EYE_STAND = 1.62;
 
-// three.js r155+ measures point and spot lights in physical units, so a torch
+// three.js r155+ measures point and spot lights in physical units, so a flashlight
 // needs a value in the tens rather than the low single digits.
-const TORCH_INTENSITY = 14;
+const FLASHLIGHT_INTENSITY = 14;
 const EYE_CROUCH = 1.02;
 
 const STAMINA_DRAIN = 17;
 const STAMINA_REGEN = 11;
 const STAMINA_MIN_TO_SPRINT = 9;
-const BATTERY_DRAIN = 1.15;
-const BATTERY_REGEN = 0.5;
+// Matches the server's drain rate so the local bar stays in step between
+// snapshots. There is no regeneration: light is a consumable now.
+const CHARGE_DRAIN = 1.0;
 
 // Turn WASD axes into a world-space direction for a given yaw.
 //
@@ -134,9 +135,10 @@ export class LocalPlayer {
     this.pitch = 0;
 
     this.stamina = 100;
-    this.battery = 100;
+    this.charge = 100;
+    this.reserve = 0;
     this.nerve = 0;              // 0 calm .. 1 panicking
-    this.torchOn = true;
+    this.flashlightOn = true;
     this.crouching = false;
     this.sprinting = false;
     this.moving = false;
@@ -152,38 +154,38 @@ export class LocalPlayer {
     this.recoilPitch = 0;
 
     this.onFootstep = null;
-    this.onTorchToggle = null;
+    this.onFlashlightToggle = null;
 
-    this.buildTorch();
+    this.buildFlashlight();
   }
 
-  buildTorch() {
-    // The torch hangs off a holder that lags the camera slightly, so the beam
+  buildFlashlight() {
+    // The flashlight hangs off a holder that lags the camera slightly, so the beam
     // swings a beat behind your head instead of being welded to it.
-    this.torchTarget = new THREE.Object3D();
-    this.scene.add(this.torchTarget);
+    this.flashlightTarget = new THREE.Object3D();
+    this.scene.add(this.flashlightTarget);
 
-    this.torch = new THREE.SpotLight(0xffe8c4, 0, 32, 0.5, 0.62, 1.25);
-    this.torch.position.set(0, 0, 0);
-    this.torch.target = this.torchTarget;
-    this.scene.add(this.torch);
+    this.flashlight = new THREE.SpotLight(0xffe8c4, 0, 32, 0.5, 0.62, 1.25);
+    this.flashlight.position.set(0, 0, 0);
+    this.flashlight.target = this.flashlightTarget;
+    this.scene.add(this.flashlight);
 
     // A weak bubble of light so you are never rendering a completely black
     // frame - players read that as a bug, not as darkness.
     this.presence = new THREE.PointLight(0x9fb4c8, 0.8, 5.0, 2.0);
     this.scene.add(this.presence);
 
-    this.torchLag = new THREE.Vector3();
+    this.flashlightLag = new THREE.Vector3();
   }
 
   setShadows(enabled, size) {
-    this.torch.castShadow = enabled;
+    this.flashlight.castShadow = enabled;
     if (enabled) {
-      this.torch.shadow.mapSize.set(size, size);
-      this.torch.shadow.camera.near = 0.2;
-      this.torch.shadow.camera.far = 26;
-      this.torch.shadow.bias = -0.0016;
-      this.torch.shadow.normalBias = 0.03;
+      this.flashlight.shadow.mapSize.set(size, size);
+      this.flashlight.shadow.camera.near = 0.2;
+      this.flashlight.shadow.camera.far = 26;
+      this.flashlight.shadow.bias = -0.0016;
+      this.flashlight.shadow.normalBias = 0.03;
     }
   }
 
@@ -191,9 +193,10 @@ export class LocalPlayer {
     this.position.set(x, 0, z);
     this.velocity.set(0, 0, 0);
     this.stamina = 100;
-    this.battery = 100;
+    this.charge = 100;
+    this.reserve = 0;
     this.nerve = 0;
-    this.torchOn = true;
+    this.flashlightOn = true;
     this.crouching = false;
     this.state = 0;
     this.alive = true;
@@ -231,15 +234,15 @@ export class LocalPlayer {
       if (this.sprintRelease === 0) this.stamina = Math.min(100, this.stamina + STAMINA_REGEN * dt);
     }
 
-    // --- Torch --------------------------------------------------------------
-    if (this.torchOn) {
-      this.battery = Math.max(0, this.battery - BATTERY_DRAIN * dt);
-      if (this.battery === 0) {
-        this.torchOn = false;
-        if (this.onTorchToggle) this.onTorchToggle(false, true);
+    // --- Flashlight --------------------------------------------------------------
+    // The server owns the charge; this is local prediction so the beam and the
+    // bar react at once rather than stepping 15 times a second.
+    if (this.flashlightOn) {
+      this.charge = Math.max(0, this.charge - CHARGE_DRAIN * dt);
+      if (this.charge === 0) {
+        this.flashlightOn = false;
+        if (this.onFlashlightToggle) this.onFlashlightToggle(false, true);
       }
-    } else {
-      this.battery = Math.min(100, this.battery + BATTERY_REGEN * dt);
     }
 
     // --- Movement -----------------------------------------------------------
@@ -293,7 +296,7 @@ export class LocalPlayer {
     }
 
     this.updateCamera(dt, planarSpeed, opts);
-    this.updateTorch(dt);
+    this.updateFlashlight(dt);
   }
 
   updateCamera(dt, planarSpeed, opts) {
@@ -328,42 +331,42 @@ export class LocalPlayer {
     this.camera.rotateZ(-bobX * 0.5 + (this.state === 1 ? 0.6 : 0));
   }
 
-  updateTorch(dt) {
+  updateFlashlight(dt) {
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
     const aim = this.camera.position.clone().addScaledVector(forward, 8);
 
     // Lag the aim point so the beam sweeps rather than snaps.
-    this.torchLag.lerp(aim, Math.min(1, dt * 11));
-    this.torchTarget.position.copy(this.torchLag);
-    this.torch.position.copy(this.camera.position).addScaledVector(forward, 0.15);
+    this.flashlightLag.lerp(aim, Math.min(1, dt * 11));
+    this.flashlightTarget.position.copy(this.flashlightLag);
+    this.flashlight.position.copy(this.camera.position).addScaledVector(forward, 0.15);
     this.presence.position.copy(this.camera.position);
 
     let intensity = 0;
-    if (this.torchOn && this.state !== 2) {
-      intensity = TORCH_INTENSITY;
+    if (this.flashlightOn && this.state !== 2) {
+      intensity = FLASHLIGHT_INTENSITY;
       // Dying battery stutters; below 15% it is actively unreliable.
-      if (this.battery < 15) {
+      if (this.charge < 15) {
         const f = Math.sin(performance.now() / 60) * Math.sin(performance.now() / 23);
-        intensity *= 0.45 + 0.55 * (this.battery / 15) + f * 0.25;
+        intensity *= 0.45 + 0.55 * (this.charge / 15) + f * 0.25;
         if (Math.random() < 0.02) intensity *= 0.15;
       }
     }
-    this.torch.intensity += (intensity - this.torch.intensity) * Math.min(1, dt * 14);
+    this.flashlight.intensity += (intensity - this.flashlight.intensity) * Math.min(1, dt * 14);
     this.presence.intensity = this.state === 2 ? 0 : 0.8;
   }
 
-  toggleTorch() {
-    if (this.battery <= 1) return false;
-    this.torchOn = !this.torchOn;
-    if (this.onTorchToggle) this.onTorchToggle(this.torchOn, false);
-    return this.torchOn;
+  toggleFlashlight() {
+    if (this.charge <= 0) return false;
+    this.flashlightOn = !this.flashlightOn;
+    if (this.onFlashlightToggle) this.onFlashlightToggle(this.flashlightOn, false);
+    return this.flashlightOn;
   }
 
   // Nerve rises in the dark and near the monster, and settles in lit rooms or
   // next to a teammate. It drives audio, grain and the vignette - never damage.
   updateNerve(dt, { monsterDistance, monsterChasing, allyNear, lit }) {
     let target = 0.25;
-    if (!this.torchOn) target += 0.25;
+    if (!this.flashlightOn) target += 0.25;
     if (lit) target -= 0.3;
     if (allyNear) target -= 0.2;
     if (Number.isFinite(monsterDistance)) {
@@ -382,7 +385,7 @@ export class LocalPlayer {
     if (this.moving) f |= FLAG.MOVING;
     if (this.sprinting) f |= FLAG.SPRINT;
     if (this.crouching) f |= FLAG.CROUCH;
-    if (this.torchOn) f |= FLAG.LIGHT;
+    if (this.flashlightOn) f |= FLAG.LIGHT;
     if (this.busy) f |= FLAG.BUSY;
     return f;
   }

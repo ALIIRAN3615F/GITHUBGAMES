@@ -18,12 +18,16 @@ import { Input, LocalPlayer } from './player.js';
 // make out a wall edge two metres away, nowhere near enough to navigate by.
 const AMBIENT_BASE = 0.5;
 
+// With the generator running the facility is genuinely lit: this is what makes
+// every room bright, not only the one with the lamps you can see.
+const AMBIENT_LIT = 9;
+
 // Never drop below this fraction of a device pixel per screen pixel: past
 // here the picture is mush and the game stops being readable in the dark.
 const MIN_RENDER_SCALE = 0.55;
 
-const HOLD_TIME = { fuse: 0.9, insert: 1.9, revive: 3.6, exit: 1.4 };
-const REACH = { fuse: 2.6, insert: 3.4, revive: 2.6, exit: 4.0 };
+const HOLD_TIME = { fuse: 0.9, insert: 1.9, revive: 3.6, exit: 1.4, battery: 0.4, power: 1.2 };
+const REACH = { fuse: 2.6, insert: 3.4, revive: 2.6, exit: 4.0, battery: 2.4, power: 3.6 };
 
 class Game {
   constructor() {
@@ -95,7 +99,7 @@ class Game {
     this.renderer.shadowMap.enabled = q.shadows;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    // Filmic tone mapping keeps the torch hotspot from blowing out to white.
+    // Filmic tone mapping keeps the flashlight hotspot from blowing out to white.
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.1;
   }
@@ -118,9 +122,9 @@ class Game {
       (QUALITY[this.settings.quality] || QUALITY.medium).shadowSize
     );
     this.player.onFootstep = (info) => this.audio.footstep(0, 0, { ...info, own: true });
-    this.player.onTorchToggle = (on, forced) => {
+    this.player.onFlashlightToggle = (on, forced) => {
       this.audio.blip(on ? 620 : 400, 0.05, 'square', 0.08);
-      if (forced) this.hud.banner('TORCH DEAD', 'bad', 2.4);
+      if (forced) this.hud.banner('FLASHLIGHT DEAD', 'bad', 2.4);
     };
 
     this.world = new World(this.scene, this.settings.quality);
@@ -214,7 +218,7 @@ class Game {
       if (this.hud.chatOpen) return;
       switch (e.code) {
         case 'KeyF':
-          if (this.phase === 'playing' && this.player.state === PLAYER_STATE.ALIVE) this.player.toggleTorch();
+          if (this.phase === 'playing' && this.player.state === PLAYER_STATE.ALIVE) this.player.toggleFlashlight();
           break;
         case 'KeyT':
         case 'Enter':
@@ -225,6 +229,9 @@ class Game {
           break;
         case 'KeyQ':
           if (this.phase === 'playing' && this.carrying) this.net.use('drop');
+          break;
+        case 'KeyR':
+          if (this.phase === 'playing' && this.player.state === PLAYER_STATE.ALIVE) this.reload();
           break;
         case 'Tab':
           if (this.phase === 'playing') this.showScoreboard(true);
@@ -237,6 +244,20 @@ class Game {
     window.addEventListener('keyup', (e) => {
       if (e.code === 'Tab') this.showScoreboard(false);
     });
+  }
+
+  // Load a fresh battery: one from the reserve, flashlight back to full.
+  reload() {
+    if (this.player.reserve <= 0) {
+      this.hud.banner('NO SPARE BATTERIES', 'bad', 1.8);
+      this.audio.blip(240, 0.08, 'square', 0.09);
+      return;
+    }
+    if (this.player.charge >= 99.5) {
+      this.hud.banner('FLASHLIGHT ALREADY FULL', '', 1.6);
+      return;
+    }
+    this.net.reload();
   }
 
   async join(name) {
@@ -276,8 +297,10 @@ class Game {
       this.exitOpen = false;
       this.roundTime = 0;
       this.spectating = null;
+      this.generatorOn = false;
       this.entities.reset();
       this.world.build(m.map);
+      this.entities.setMap(m.map);
 
       const spawn = m.map.spawnPoints[Math.floor(Math.random() * m.map.spawnPoints.length)] || m.map.spawn;
       this.player.spawn(spawn.x, spawn.z);
@@ -344,14 +367,24 @@ class Game {
     this.entities.push(m);
     this.powered = m.g;
     this.exitOpen = !!m.x;
+    this.generatorOn = !!m.o;
     this.roundTime = m.tm;
 
+    // Row: [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
     const mine = (m.p || []).find((row) => row[0] === this.localId);
     if (mine) {
       const wasState = this.player.state;
-      this.player.state = mine[6];
-      this.carrying = mine[7] >= 0;
-      this.downTimer = mine[8];
+      this.player.state = mine[7];
+      this.carrying = mine[8] >= 0;
+      this.downTimer = mine[9];
+
+      // The server owns charge and reserve. Local prediction keeps the bar
+      // smooth between snapshots; this is the correction.
+      const serverCharge = mine[10];
+      if (Math.abs(serverCharge - this.player.charge) > 2) this.player.charge = serverCharge;
+      else this.player.charge = Math.min(this.player.charge, serverCharge + 1);
+      this.player.reserve = mine[11];
+      if (this.player.charge <= 0) this.player.flashlightOn = false;
 
       if (wasState !== this.player.state) this.onOwnStateChange(wasState, this.player.state);
       // The server is the authority on where a downed body lies.
@@ -408,10 +441,36 @@ class Game {
         if (ev.n < ev.need) this.hud.banner(`${ev.n} / ${ev.need} FUSES`, '', 2.4);
         break;
       case 'power':
-        this.audio.powerUp();
-        this.audio.doorOpen(ev.x, ev.z);
-        this.hud.banner('POWER RESTORED - GET TO THE EXIT', 'good', 5);
-        this.hud.addSystem('The blast door is open. It knows exactly where you are now.');
+        if (ev.on) {
+          this.audio.powerUp();
+          this.audio.doorOpen(ev.x, ev.z);
+          this.hud.banner('POWER ON - THE BUILDING IS LIT', 'good', 4.5);
+          this.hud.addSystem(ev.by
+            ? `${ev.by} started the generator. Every light in the facility is on.`
+            : 'The generator caught. Every light in the facility is on - and it knows where you are.');
+        } else {
+          this.audio.blip(180, 0.5, 'sawtooth', 0.16);
+          this.hud.banner('POWER CUT - DARK AGAIN', 'bad', 3.5);
+          this.hud.addSystem(`${ev.by || 'Someone'} cut the power. The lights are out.`);
+        }
+        break;
+      case 'battery':
+        if (ev.id === this.localId) {
+          this.audio.pickup();
+          this.hud.banner(`BATTERY TAKEN - ${ev.n} IN RESERVE`, '', 1.8);
+        }
+        break;
+      case 'reload':
+        if (ev.id === this.localId) {
+          this.audio.blip(520, 0.12, 'square', 0.12);
+          this.hud.banner('FRESH BATTERY LOADED', 'good', 1.8);
+        }
+        break;
+      case 'dead-battery':
+        if (ev.id === this.localId) {
+          this.hud.banner('FLASHLIGHT DEAD - PRESS R', 'bad', 3.2);
+          this.hud.addSystem('Your flashlight is out. Load a spare with R.');
+        }
         break;
       case 'down':
         if (ev.id !== this.localId) {
@@ -431,6 +490,10 @@ class Game {
         break;
       case 'pickup':
         if (ev.by) this.hud.addSystem(`${ev.by} picked up a fuse.`);
+        if (ev.id === this.localId && ev.recharged) {
+          this.audio.blip(700, 0.18, 'triangle', 0.14);
+          this.hud.banner('FUSE CELL - FLASHLIGHT FULL', 'good', 2.6);
+        }
         break;
       case 'joined':
         this.hud.addSystem(`${ev.name} joined.`);
@@ -491,7 +554,7 @@ class Game {
     this.hud.setEndCountdown(Math.ceil(this.endCountdown));
     // Keep the world drifting behind the results card rather than freezing.
     this.entities.update(dt, this.localId, this.camera.position);
-    this.world.update(dt, this.camera.position, this.powered, this.exitOpen);
+    this.world.update(dt, this.camera.position, this.powered, this.exitOpen, this.generatorOn);
   }
 
   updatePlaying(dt) {
@@ -501,7 +564,7 @@ class Game {
     if (this.player.state === PLAYER_STATE.DEAD) this.spectate(dt);
 
     this.entities.update(dt, this.localId, this.camera.position);
-    this.world.update(dt, this.player.position, this.powered, this.exitOpen);
+    this.world.update(dt, this.player.position, this.powered, this.exitOpen, this.generatorOn);
 
     const threat = this.entities.nearestMonster(this.player.position);
     this.updateFear(dt, threat);
@@ -515,7 +578,7 @@ class Game {
       this.updateHud(dt);
     }
 
-    this.net.sendInput(this.player.position, this.player.yaw, this.player.flags());
+    this.net.sendInput(this.player.position, this.player.yaw, this.player.pitch, this.player.flags());
   }
 
   // Dead players ride along with whoever is still breathing.
@@ -547,11 +610,15 @@ class Game {
     });
     this.fx.update(dt, this.player.nerve);
 
-    // The room brightens a little once the generator carries load.
-    const targetAmbient = AMBIENT_BASE + (this.powered / Math.max(1, this.need)) * AMBIENT_BASE * 0.8;
-    this.ambient.intensity += (targetAmbient - this.ambient.intensity) * Math.min(1, dt);
-    const targetFog = this.exitOpen ? 0.055 : 0.072;
-    this.scene.fog.density += (targetFog - this.scene.fog.density) * Math.min(1, dt * 0.5);
+    // Running the generator lights the whole facility, not just its own room.
+    // Doing that with real lights would mean dozens of them; lifting ambient
+    // does it for every room at once and costs nothing per pixel, while the
+    // nearest ceiling lamps still supply local pools of light.
+    const targetAmbient = this.generatorOn ? AMBIENT_LIT : AMBIENT_BASE;
+    this.ambient.intensity += (targetAmbient - this.ambient.intensity) * Math.min(1, dt * 1.5);
+    // With the lights on you can see across a room, so the murk lifts too.
+    const targetFog = this.generatorOn ? 0.038 : 0.072;
+    this.scene.fog.density += (targetFog - this.scene.fog.density) * Math.min(1, dt * 0.8);
   }
 
   // --- Interaction ----------------------------------------------------------
@@ -620,6 +687,18 @@ class Game {
       const e = this.map.exit;
       candidates.push({ kind: 'exit', id: 0, x: e.x, z: e.z, label: 'Escape' });
     }
+    // Once every fuse is seated the generator becomes a switch for the whole
+    // building, and it can be thrown either way.
+    if (!this.carrying && this.map && this.powered >= this.need) {
+      const g = this.map.generator;
+      candidates.push({
+        kind: 'power', id: 0, x: g.x, z: g.z,
+        label: this.generatorOn ? 'Cut the power' : 'Start the generator',
+      });
+    }
+    for (const item of this.entities.interactables()) {
+      if (item.kind === 'battery') candidates.push({ ...item, label: 'Take the battery' });
+    }
     if (!this.carrying) {
       for (const item of this.entities.interactables()) {
         if (item.kind === 'fuse') candidates.push({ ...item, label: 'Take the fuse' });
@@ -678,7 +757,7 @@ class Game {
     }
 
     // An occasional growl when it is near but not yet chasing: the sound that
-    // makes people turn their torch off.
+    // makes people turn their flashlight off.
     this.growlTimer -= dt;
     if (this.growlTimer <= 0) {
       this.growlTimer = 7 + Math.random() * 9;
@@ -717,7 +796,8 @@ class Game {
   }
 
   updateHud(dt) {
-    this.hud.setMeters(this.player.stamina, this.player.battery);
+    this.hud.setMeters(this.player.stamina, this.player.charge);
+    this.hud.setReserve(this.player.reserve);
     this.hud.setCarrying(!!this.carrying);
     this.hud.setFusePips(this.powered, this.need);
     this.hud.setPing(this.net.ping);
@@ -726,6 +806,8 @@ class Game {
 
     if (this.exitOpen) {
       this.hud.setObjective('RUN. The exit is open.', true);
+    } else if (this.powered >= this.need) {
+      this.hud.setObjective(this.generatorOn ? 'The building is lit' : 'Start the generator');
     } else if (this.carrying) {
       this.hud.setObjective('Carry the fuse to the generator');
     } else if (this.powered > 0) {
@@ -739,9 +821,9 @@ class Game {
       const row = this.snapshot ? (this.snapshot.p || []).find((r) => r[0] === id) : null;
       roster.push({
         id, name: info.name, color: info.color,
-        state: row ? row[6] : 0,
-        carrying: row ? row[7] >= 0 : false,
-        downTimer: row ? row[8] : 0,
+        state: row ? row[7] : 0,
+        carrying: row ? row[8] >= 0 : false,
+        downTimer: row ? row[9] : 0,
       });
     }
     this.hud.updateRoster(roster, this.localId);

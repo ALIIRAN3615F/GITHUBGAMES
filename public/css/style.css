@@ -118,6 +118,20 @@ html, body {
 .meter-fill.battery { background: linear-gradient(90deg, var(--amber-dim), var(--amber)); }
 .meter-fill.battery.low { background: linear-gradient(90deg, #7a2f22, var(--blood)); }
 
+#reserveRow {
+  margin-top: 6px;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em;
+  color: var(--ink-dim); display: flex; align-items: center; gap: 6px;
+}
+#reserveRow b { color: var(--ink); font-weight: 600; font-size: 12px; }
+#reserveRow.empty b { color: var(--blood); }
+.cell-icon {
+  width: 6px; height: 11px; border-radius: 1px;
+  background: linear-gradient(180deg, #27c07a, #1c6b47);
+  box-shadow: 0 0 6px rgba(39, 192, 122, 0.55);
+}
+#chargeVal { color: var(--amber); }
+
 #carrying {
   font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
   color: var(--amber); display: flex; align-items: center; gap: 7px;

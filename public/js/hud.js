@@ -22,6 +22,9 @@ export class Hud {
       fusePips: $('fusePips'),
       staminaFill: $('staminaFill'),
       batteryFill: $('batteryFill'),
+      chargeVal: $('chargeVal'),
+      reserveRow: $('reserveRow'),
+      reserveVal: $('reserveVal'),
       carrying: $('carrying'),
       roster: $('roster'),
       pingVal: $('pingVal'),
@@ -224,7 +227,16 @@ export class Hud {
       this.lastBattery = b;
       this.el.batteryFill.style.transform = `scaleX(${b / 100})`;
       this.el.batteryFill.classList.toggle('low', b < 20);
+      this.el.chargeVal.textContent = b + '%';
     }
+  }
+
+  // Spare batteries carried. Updates the moment one is picked up or spent.
+  setReserve(count) {
+    if (count === this.lastReserve) return;
+    this.lastReserve = count;
+    this.el.reserveVal.textContent = String(count);
+    this.el.reserveRow.classList.toggle('empty', count === 0);
   }
 
   setObjective(text, urgent = false) {

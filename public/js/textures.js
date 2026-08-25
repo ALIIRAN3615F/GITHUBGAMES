@@ -239,7 +239,7 @@ export function bloodDecal(seed = 41, size = 128) {
   return tex;
 }
 
-// Soft radial falloff used for light glows, fuse halos and the torch cone.
+// Soft radial falloff used for light glows, fuse halos and the flashlight cone.
 export function glowSprite(color = '#ffd08a', size = 128) {
   const { canvas, ctx } = makeCanvas(size);
   const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);

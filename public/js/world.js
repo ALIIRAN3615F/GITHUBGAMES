@@ -3,7 +3,7 @@
 // The server sends a grid plus a prop list; everything visible is built here.
 // Two rules drive the structure: batch aggressively (instanced meshes, merged
 // prop geometry) because a maze is thousands of boxes, and spend the very small
-// light budget where it changes how the game plays - the torch, the generator,
+// light budget where it changes how the game plays - the flashlight, the generator,
 // the exit.
 
 import * as THREE from '../vendor/three.module.js';
@@ -363,17 +363,17 @@ export class World {
 
   // --- Per-frame -----------------------------------------------------------
 
-  update(dt, playerPos, powered, exitOpen) {
+  update(dt, playerPos, powered, exitOpen, generatorOn) {
     this.flickerPhase += dt;
     const need = this.map ? this.map.fuseCount : 1;
     const ratio = need ? powered / need : 0;
 
-    // Generator: red while starved, amber as it takes load, green once fed.
+    // Generator: red while starved, amber as it takes load, green once running.
     if (this.generatorLight) {
-      const color = exitOpen ? 0x66ff8a : ratio > 0 ? 0xffa23a : 0xff5a34;
+      const color = generatorOn ? 0x66ff8a : ratio > 0 ? 0xffa23a : 0xff5a34;
       this.generatorLight.color.setHex(color);
       this.generatorBeacon.material.color.setHex(color);
-      const pulse = 0.75 + Math.sin(this.flickerPhase * (exitOpen ? 7 : 2.2)) * 0.35;
+      const pulse = 0.75 + Math.sin(this.flickerPhase * (generatorOn ? 7 : 2.2)) * 0.35;
       this.generatorLight.intensity = (7 + ratio * 13) * pulse;
     }
     for (let i = 0; i < this.fuseSlots.length; i++) {
@@ -382,6 +382,8 @@ export class World {
 
     // Exit: the door lifts and the lamp turns when the power lands.
     if (this.exitDoor) {
+      // The blast door stays open once it has been opened - cutting the power
+      // must not seal survivors in.
       const target = exitOpen ? 4.4 : 1.5;
       this.exitDoor.position.y += (target - this.exitDoor.position.y) * Math.min(1, dt * 0.9);
       const c = exitOpen ? 0x3dff77 : 0xff2a1a;
@@ -390,21 +392,22 @@ export class World {
       this.exitLight.intensity = exitOpen ? 24 + Math.sin(this.flickerPhase * 3) * 6 : 9;
     }
 
-    this.updateLamps(dt, playerPos, ratio, exitOpen);
+    this.updateLamps(dt, playerPos, ratio, generatorOn);
   }
 
   // Lamps come on in step with the generator, and only the handful nearest the
   // camera are given a real light.
-  updateLamps(dt, playerPos, ratio, exitOpen) {
+  // The generator is a building-wide switch: every lamp in the facility runs
+  // off it, not just the ones in the generator room. The lamps nearest the
+  // camera get real point lights for local pools of light; the rest are lit by
+  // the ambient lift applied in main.js, which costs nothing per pixel.
+  updateLamps(dt, playerPos, ratio, generatorOn) {
     if (!this.lamps.length) return;
-    const litFraction = exitOpen ? 1 : ratio * 0.8;
     let anyOn = false;
 
     for (let i = 0; i < this.lamps.length; i++) {
       const lamp = this.lamps[i];
-      // Deterministic per-lamp threshold, so lamps light up in a stable order.
-      const threshold = ((i * 2654435761) % 1000) / 1000;
-      lamp.on = threshold < litFraction;
+      lamp.on = generatorOn;
       if (lamp.on) anyOn = true;
     }
 

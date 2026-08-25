@@ -41,8 +41,9 @@
       <div class="meter-track"><div class="meter-fill stamina" id="staminaFill"></div></div>
     </div>
     <div class="meter" id="batteryMeter">
-      <div class="meter-label">TORCH</div>
+      <div class="meter-label">FLASHLIGHT <span id="chargeVal">100%</span></div>
       <div class="meter-track"><div class="meter-fill battery" id="batteryFill"></div></div>
+      <div id="reserveRow"><span class="cell-icon"></span>BATTERIES <b id="reserveVal">0</b></div>
     </div>
     <div id="carrying" hidden><span class="carry-icon"></span> CARRYING FUSE</div>
   </div>
@@ -101,7 +102,7 @@
 
     <div class="controls-hint">
       <div><b>WASD</b> move</div><div><b>SHIFT</b> sprint</div><div><b>CTRL</b> crouch</div>
-      <div><b>F</b> torch</div><div><b>E</b> interact</div><div><b>T</b> radio</div>
+      <div><b>F</b> flashlight</div><div><b>E</b> interact</div><div><b>R</b> reload light</div><div><b>T</b> radio</div>
       <div><b>TAB</b> scores</div><div><b>ESC</b> menu</div>
     </div>
   </section>
@@ -144,7 +145,7 @@
     <div class="brief">
       <b>How it works.</b> Fuses are scattered through the dark. You can carry one at a time.
       Feed them all into the generator, then run for the exit. The thing down here hunts by sound
-      and by light &mdash; sprinting is loud, your torch is a beacon, crouching is quiet.
+      and by light &mdash; sprinting is loud, your flashlight is a beacon, crouching is quiet.
       If it catches you, you go down; a teammate has to reach you before you bleed out.
     </div>
   </section>

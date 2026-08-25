@@ -47,8 +47,9 @@ Run on another port with `npm start -- --port 8081` (or set `PORT`).
 | `W A S D` | move |
 | `Shift` | sprint — fast, and *loud* |
 | `Ctrl` / `C` | crouch — slow, and nearly silent |
-| `F` | torch on/off |
-| `E` | hold to interact (take fuse, seat fuse, revive, escape) |
+| `F` | flashlight on/off |
+| `E` | hold to interact (take fuse, seat fuse, take battery, throw the power switch, revive, escape) |
+| `R` | load a fresh battery into the flashlight |
 | `Q` | drop the fuse you are carrying |
 | `T` | radio (text chat) |
 | `Tab` | scoreboard |
@@ -59,8 +60,22 @@ Run on another port with `npm start -- --port 8081` (or set `PORT`).
 **You carry one fuse at a time.** Every fuse is its own round trip into the dark and
 back to the generator, which means splitting up — and splitting up is how people die.
 
+**Light is a consumable.** Your flashlight runs on a charge that only ever goes
+down. There are **24 spare batteries** hidden around the facility; picking one up
+banks it in reserve rather than spending it, and `R` loads exactly one when you
+need it. Fuses are live cells, so carrying one to the generator tops your
+flashlight straight back to full - which is the compensation for hauling the most
+dangerous object in the building across it.
+
+**The generator is a building-wide switch.** Seat every fuse and it starts,
+lighting the whole facility rather than just its own room, and opening the blast
+door. After that it stays a switch: anyone standing at it can cut the power and
+put the building back into darkness. Sometimes you will want to. The lights make
+you visible from a long way off, and the thing down here is drawn to them - but
+the blast door, once open, stays open.
+
 **The monster hunts by sound and light.** Sprinting is the loudest thing you can do.
-Your torch is a beacon it can see from across the level. Crouching in the dark makes you
+Your flashlight is a beacon it can see from across the level. Crouching in the dark makes you
 nearly invisible, and nearly blind. Seating a fuse is loud enough to call it to the
 generator, so the safest moment to run for the next one is the moment after someone
 else has just finished.
@@ -92,7 +107,7 @@ public/
   js/main.js    renderer, round state machine, glue
   js/world.js   level geometry, instanced walls and props, light budget
   js/entities.js monster, survivors and fuses, with snapshot interpolation
-  js/player.js  local movement, torch, stamina, nerve
+  js/player.js  local movement, flashlight, stamina, nerve
   js/audio.js   every sound, synthesised at runtime
   js/textures.js every surface, painted into a canvas at startup
   js/net.js     WebSocket client
@@ -142,7 +157,7 @@ The game watches its own frame time and quietly lowers render resolution when it
 cannot hold ~40 fps, restoring it when there is headroom again, so a weaker machine
 degrades in sharpness rather than in smoothness. If it still struggles, drop
 **Graphics** to Low in the pause menu (`Esc`): that turns off shadows, the ceiling
-lamps and other players' torch lights, which is where nearly all the remaining cost
+lamps and other players' flashlight lights, which is where nearly all the remaining cost
 is. The scene itself is cheap — a whole maze is one instanced draw call — so the
 limit is per-pixel lighting, which is exactly what resolution trades against.
 

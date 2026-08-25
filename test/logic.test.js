@@ -445,7 +445,7 @@ test('a disconnect mid-carry returns the fuse to the floor', () => {
   assert.strictEqual(session.fuses[0].state, 0, 'the fuse left with them');
 });
 
-test('snapshots carry every player, monster and fuse', () => {
+test('snapshots carry every player, monster, fuse and battery', () => {
   const { session, players } = startedSession(2);
   const conn = players[0].conn;
   session.sendSnapshot();
@@ -453,11 +453,163 @@ test('snapshots carry every player, monster and fuse', () => {
   assert.strictEqual(snap.p.length, 2);
   assert.strictEqual(snap.m.length, session.monsters.length);
   assert.strictEqual(snap.f.length, session.fuses.length);
-  assert.strictEqual(snap.p[0].length, 9, 'player row layout changed');
+  assert.strictEqual(snap.b.length, session.batteries.length);
+  // [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
+  assert.strictEqual(snap.p[0].length, 12, 'player row layout changed');
+  assert.strictEqual(typeof snap.o, 'number', 'generator state not broadcast');
 });
 
 test('an empty session falls back to the lobby', () => {
   const { session, players } = startedSession(1);
   session.removePlayer(players[0].id);
   assert.strictEqual(session.phase, 'lobby');
+});
+
+// --- Flashlight economy and the power switch --------------------------------
+
+test('24 batteries are hidden on every map size', () => {
+  const { BATTERY_COUNT } = require('../server/mapgen');
+  assert.strictEqual(BATTERY_COUNT, 24);
+  for (const size of ['small', 'medium', 'large']) {
+    for (const seed of [1, 2, 3]) {
+      const map = generate({ seed, size });
+      assert.strictEqual(map.batteries.length, 24, `${size}/${seed}: wrong battery count`);
+      const cells = new Set(map.batteries.map((b) => `${b.cx},${b.cy}`));
+      assert.strictEqual(cells.size, 24, `${size}/${seed}: batteries stacked on each other`);
+      const grid = gridOf(map);
+      for (const b of map.batteries) {
+        assert.strictEqual(grid[idx(b.cx, b.cy, map.w)], 1, `${size}/${seed}: battery inside rock`);
+      }
+    }
+  }
+});
+
+test('the flashlight drains only while lit, and never recharges itself', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  assert.strictEqual(p.charge, 100);
+
+  p.flags = 0;                       // light off
+  for (let i = 0; i < 30 * 10; i++) session.update(1 / 30);
+  assert.strictEqual(p.charge, 100, 'charge moved with the light off');
+
+  p.flags = 8;                       // light on
+  for (let i = 0; i < 30 * 10; i++) session.update(1 / 30);
+  assert.ok(p.charge < 95 && p.charge > 85, `unexpected drain: ${p.charge}`);
+
+  const low = p.charge;
+  p.flags = 0;
+  for (let i = 0; i < 30 * 10; i++) session.update(1 / 30);
+  assert.strictEqual(p.charge, low, 'the flashlight recharged on its own');
+});
+
+test('a flat battery switches the light off by itself', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  p.charge = 2;
+  p.flags = 8;
+  for (let i = 0; i < 30 * 5; i++) session.update(1 / 30);
+  assert.strictEqual(p.charge, 0);
+  assert.strictEqual(p.flags & 8, 0, 'the light stayed on with a flat battery');
+});
+
+test('picking up a battery banks it instead of spending it', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  p.charge = 40;
+  const battery = session.batteries[0];
+  p.x = battery.x; p.z = battery.z;
+
+  session.handle(p, { t: 'use', k: 'battery', id: battery.id });
+  assert.strictEqual(p.reserve, 1, 'battery not banked');
+  assert.strictEqual(p.charge, 40, 'pickup spent the battery immediately');
+  assert.ok(session.batteries[0].taken, 'battery still on the floor');
+
+  // And it cannot be picked up twice.
+  session.handle(p, { t: 'use', k: 'battery', id: battery.id });
+  assert.strictEqual(p.reserve, 1, 'the same battery was collected twice');
+});
+
+test('batteries cannot be collected from across the map', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  const battery = session.batteries[0];
+  p.x = battery.x + 50; p.z = battery.z + 50;
+  session.handle(p, { t: 'use', k: 'battery', id: battery.id });
+  assert.strictEqual(p.reserve, 0);
+});
+
+test('reloading spends exactly one battery and refills the charge', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  p.reserve = 7;
+  p.charge = 0;
+
+  session.handle(p, { t: 'use', k: 'reload' });
+  assert.strictEqual(p.charge, 100, 'reload did not refill');
+  assert.strictEqual(p.reserve, 6, 'reload consumed the wrong number of batteries');
+
+  // A full flashlight must not waste a battery.
+  session.handle(p, { t: 'use', k: 'reload' });
+  assert.strictEqual(p.reserve, 6, 'a battery was burned on a full flashlight');
+
+  // And an empty reserve cannot conjure one.
+  p.reserve = 0;
+  p.charge = 10;
+  session.handle(p, { t: 'use', k: 'reload' });
+  assert.strictEqual(p.charge, 10, 'reloaded from an empty reserve');
+});
+
+test('picking up a fuse fully recharges the flashlight', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  p.charge = 23;
+  const fuse = session.fuses[0];
+  p.x = fuse.x; p.z = fuse.z;
+  session.handle(p, { t: 'use', k: 'fuse', id: fuse.id });
+  assert.strictEqual(p.carrying, fuse.id, 'fuse pickup failed');
+  assert.strictEqual(p.charge, 100, 'the fuse did not recharge the flashlight');
+});
+
+test('the generator switch is authoritative and only live once fully fused', () => {
+  const { session, players } = startedSession(2, { fuses: 3 });
+  const [a, b] = players;
+  const gen = session.map.generator;
+
+  a.x = gen.x; a.z = gen.z;
+  session.handle(a, { t: 'use', k: 'power' });
+  assert.strictEqual(session.generatorOn, false, 'powered up without any fuses');
+
+  // Seat every fuse; the last one brings the building up on its own.
+  for (const fuse of session.fuses) {
+    a.x = fuse.x; a.z = fuse.z;
+    session.handle(a, { t: 'use', k: 'fuse', id: fuse.id });
+    a.x = gen.x; a.z = gen.z;
+    session.handle(a, { t: 'use', k: 'insert' });
+  }
+  assert.strictEqual(session.generatorOn, true, 'the last fuse did not start the generator');
+  assert.strictEqual(session.exitOpen, true);
+
+  // Now it is a switch, and either player can throw it.
+  session.handle(a, { t: 'use', k: 'power' });
+  assert.strictEqual(session.generatorOn, false, 'could not switch the power off');
+  assert.strictEqual(session.exitOpen, true, 'the blast door should stay open once opened');
+
+  b.x = gen.x; b.z = gen.z;
+  session.handle(b, { t: 'use', k: 'power' });
+  assert.strictEqual(session.generatorOn, true, 'a second player could not switch it back on');
+
+  // Not from the other end of the facility, though.
+  b.x = gen.x + 40;
+  session.handle(b, { t: 'use', k: 'power' });
+  assert.strictEqual(session.generatorOn, true, 'switched the power from across the map');
+});
+
+test('pitch is accepted and clamped', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  session.handle(p, { t: 'input', p: [p.x, 0, p.z], y: 0, pt: 0.7, f: 0 });
+  assert.ok(Math.abs(p.pitch - 0.7) < 1e-6, 'pitch not stored');
+  session.handle(p, { t: 'input', p: [p.x, 0, p.z], y: 0, pt: 99, f: 0 });
+  assert.ok(p.pitch <= 1.6, 'pitch not clamped');
 });

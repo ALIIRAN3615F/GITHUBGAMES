@@ -110,24 +110,35 @@ test('the spawn-facing table looks down the grid direction it claims', async () 
   assert.ok(block.includes('{ dx: 0, dy: 1, yaw: Math.PI }'), 'south yaw in main.js no longer matches this test');
 });
 
-test('a survivor avatar shines its torch where that player is looking', async () => {
+test('a survivor avatar aims its flashlight where that player is looking', async () => {
   const { THREE } = await load();
-  // The cone is built along local -Z; the group is rotated by the player's yaw.
-  const beamLocal = new THREE.Vector3(0, 0, -1);
-  for (let deg = 0; deg < 360; deg += 45) {
-    const yaw = deg * Math.PI / 180;
-    const group = new THREE.Object3D();
-    group.rotation.y = yaw;
-    group.updateMatrixWorld(true);
-    const beam = beamLocal.clone().applyQuaternion(group.quaternion);
-    const look = cameraLook(THREE, yaw);
-    const off = angleBetween(beam.x, beam.z, look.x, look.z);
-    assert.ok(off < 0.001, `yaw ${deg}: the avatar's beam is ${off.toFixed(0)} degrees off their view`);
+  // The avatar carries no beam geometry any more - a cone mesh read as a solid
+  // object sticking out of the player. A pooled spotlight is aimed instead,
+  // composing yaw and pitch exactly as the owner's camera does (YXZ).
+  for (const yawDeg of [0, 90, 180, 270]) {
+    for (const pitch of [-0.8, 0, 0.6]) {
+      const yaw = yawDeg * Math.PI / 180;
+      const beam = new THREE.Vector3(0, 0, -1)
+        .applyEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+
+      const cam = new THREE.PerspectiveCamera();
+      cam.rotation.set(0, 0, 0);
+      cam.rotateY(yaw);
+      cam.rotateX(pitch);
+      const look = new THREE.Vector3();
+      cam.getWorldDirection(look);
+
+      const off = Math.acos(Math.max(-1, Math.min(1, beam.dot(look)))) * 180 / Math.PI;
+      assert.ok(off < 0.001,
+        `yaw ${yawDeg} pitch ${pitch}: beam is ${off.toFixed(1)} degrees off the view`);
+    }
   }
 
   const src = require('fs').readFileSync(require.resolve('../public/js/entities.js'), 'utf8');
-  assert.ok(src.includes('coneGeo.rotateX(Math.PI / 2)'),
-    'the torch cone is no longer laid along local -Z');
+  assert.ok(!/const cone = new THREE\.Mesh/.test(src),
+    'the beam cone mesh is back - it reads as an object, not as light');
+  assert.ok(src.includes("new THREE.Euler(owner.entity.data.pitch || 0, g.rotation.y, 0, 'YXZ')"),
+    'the pooled flashlight no longer aims with pitch');
 });
 
 test('the monster faces the way it is walking', async () => {

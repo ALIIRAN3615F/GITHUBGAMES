@@ -31,6 +31,12 @@ const SPEED = { walk: 3.2, sprint: 5.6, crouch: 1.65 };
 // follow a one-cell corridor without grinding along both walls.
 const MONSTER_RADIUS = 0.4;
 
+// Flashlight economy. Charge is a percentage; one spare battery restores a
+// full charge, and there is no trickle recharge - light is a consumable you
+// have to go looking for.
+const FLASHLIGHT_DRAIN = 1.0;      // percent per second while lit
+const MAX_RESERVE = 24;
+
 const DIFFICULTY = {
   calm:      { patrol: 2.0, chase: 4.05, hearing: 17, sight: 17, grace: 40, bleed: 60, monsters: 1, label: 'Calm' },
   normal:    { patrol: 2.4, chase: 4.70, hearing: 23, sight: 21, grace: 25, bleed: 45, monsters: 1, label: 'Normal' },
@@ -56,8 +62,10 @@ class Session {
     this.grid = null;
     this.monsters = [];
     this.fuses = [];
+    this.batteries = [];
     this.powered = 0;
     this.exitOpen = false;
+    this.generatorOn = false;
     this.tick = 0;
     this.roundTime = 0;
     this.endsAt = 0;
@@ -84,13 +92,16 @@ class Session {
       color,
       ready: false,
       state: ST_ALIVE,
-      x: 0, y: 0, z: 0, yaw: 0,
+      x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
       flags: 0,
+      charge: 100,          // flashlight charge, 0-100
+      reserve: 0,           // spare batteries carried
+
       carrying: null,
       downTimer: 0,
       downs: 0,
       bleedTotal: 0,
-      stats: { fuses: 0, revives: 0, escaped: false },
+      stats: { fuses: 0, revives: 0, escaped: false, batteries: 0 },
       lastInput: Date.now(),
       joinedMidRound: false,
     };
@@ -171,6 +182,9 @@ class Session {
     }
     player.y = Math.max(-2, Math.min(4, ny));
     player.yaw = Number.isFinite(msg.y) ? msg.y : player.yaw;
+    // Pitch matters now: without it a remote flashlight beam is stuck level
+    // no matter where its owner is actually looking.
+    if (Number.isFinite(msg.pt)) player.pitch = Math.max(-1.6, Math.min(1.6, msg.pt));
     player.flags = (msg.f | 0) & 31;
     if (player.state !== ST_ALIVE) player.flags &= ~(F_SPRINT | F_MOVING);
   }
@@ -183,6 +197,9 @@ class Session {
       case 'revive': return this.revive(player, msg.id);
       case 'exit':   return this.escape(player);
       case 'drop':   return this.dropFuse(player);
+      case 'battery': return this.takeBattery(player, msg.id);
+      case 'reload': return this.reloadFlashlight(player);
+      case 'power':  return this.toggleGenerator(player);
       default:       return undefined;
     }
   }
@@ -234,8 +251,10 @@ class Session {
     }
 
     this.fuses = this.map.fuses.map((f) => ({ id: f.id, x: f.x, z: f.z, state: 0, holder: null }));
+    this.batteries = this.map.batteries.map((b) => ({ id: b.id, x: b.x, z: b.z, taken: false }));
     this.powered = 0;
     this.exitOpen = false;
+    this.generatorOn = false;
     this.roundTime = 0;
     this.outcome = null;
     this.phase = 'playing';
@@ -253,7 +272,9 @@ class Session {
       p.bleedTotal = 0;
       p.ready = false;
       p.joinedMidRound = false;
-      p.stats = { fuses: 0, revives: 0, escaped: false };
+      p.stats = { fuses: 0, revives: 0, escaped: false, batteries: 0 };
+      p.charge = 100;
+      p.reserve = 0;
       this.placeAtSpawn(p);
     }
 
@@ -303,6 +324,8 @@ class Session {
     this.phase = 'lobby';
     this.monsters = [];
     this.fuses = [];
+    this.batteries = [];
+    this.generatorOn = false;
     this.map = null;
     this.grid = null;
     for (const p of this.players.values()) { p.ready = false; p.state = ST_ALIVE; p.carrying = null; }
@@ -321,7 +344,11 @@ class Session {
     fuse.state = 1;
     fuse.holder = player.id;
     player.carrying = fuse.id;
-    this.event({ k: 'pickup', x: fuse.x, z: fuse.z, by: player.name });
+    // A fuse is a live cell: handling one tops the flashlight right up. That
+    // is the reward for the risk of carrying it across the map.
+    const recharged = player.charge < 99.5;
+    player.charge = 100;
+    this.event({ k: 'pickup', x: fuse.x, z: fuse.z, by: player.name, id: player.id, recharged });
     this.hearNoise(player.x, player.z, 0.55);
   }
 
@@ -355,10 +382,52 @@ class Session {
     this.hearNoise(gen.x, gen.z, complete ? 3.0 : 1.6);
 
     if (complete) {
-      this.exitOpen = true;
-      this.event({ k: 'power', x: this.map.exit.x, z: this.map.exit.z });
+      this.exitOpen = true;          // the blast door latches open once opened
+      this.generatorOn = true;
+      this.event({ k: 'power', on: true, x: this.map.exit.x, z: this.map.exit.z });
       for (const m of this.monsters) { m.state = 'hunt'; m.lastKnown = { x: gen.x, z: gen.z }; m.repathIn = 0; }
     }
+  }
+
+// Batteries are the flashlight's ammunition: collected into a reserve, never
+  // spent on the spot.
+  takeBattery(player, batteryId) {
+    if (player.state !== ST_ALIVE) return;
+    const battery = this.batteries.find((b) => b.id === batteryId);
+    if (!battery || battery.taken) return;
+    if (dist2(player.x, player.z, battery.x, battery.z) > 3.2 * 3.2) return;
+    if (player.reserve >= MAX_RESERVE) return;
+
+    battery.taken = true;
+    player.reserve++;
+    player.stats.batteries++;
+    this.event({ k: 'battery', by: player.name, id: player.id, x: battery.x, z: battery.z, n: player.reserve });
+  }
+
+  // One battery, one full charge. Never the whole reserve at once.
+  reloadFlashlight(player) {
+    if (player.state !== ST_ALIVE) return;
+    if (player.reserve <= 0) return;
+    if (player.charge >= 99.5) return;      // nothing to gain, keep the battery
+    player.reserve--;
+    player.charge = 100;
+    this.event({ k: 'reload', id: player.id, n: player.reserve });
+    this.hearNoise(player.x, player.z, 0.35);
+  }
+
+  // The building's power switch. Only throwable once every fuse is seated,
+  // and authoritative: one flag, broadcast to everyone, so nobody disagrees
+  // about whether the lights are on.
+  toggleGenerator(player) {
+    if (player.state !== ST_ALIVE) return;
+    if (this.powered < this.map.fuseCount) return;
+    const gen = this.map.generator;
+    if (dist2(player.x, player.z, gen.x, gen.z) > 4.0 * 4.0) return;
+
+    this.generatorOn = !this.generatorOn;
+    this.event({ k: 'power', on: this.generatorOn, by: player.name, x: gen.x, z: gen.z });
+    // Throwing the switch either way is loud.
+    this.hearNoise(gen.x, gen.z, 2.0);
   }
 
   revive(player, targetId) {
@@ -452,10 +521,28 @@ class Session {
       }
     }
 
+    this.drainFlashlights(dt);
     for (const m of this.monsters) this.updateMonster(m, dt);
     this.updateDirector(dt);
 
     if (this.tick % SNAP_EVERY === 0) this.sendSnapshot();
+  }
+
+// Charge is spent on the server so every client agrees how much light a
+  // player has left, and so a tampered client cannot grant itself infinite
+  // battery. Clients predict the same drain locally to keep the bar smooth.
+  drainFlashlights(dt) {
+    for (const p of this.players.values()) {
+      if (!(p.flags & F_LIGHT)) continue;
+      if (p.state !== ST_ALIVE) continue;
+      if (p.charge <= 0) continue;
+      p.charge = Math.max(0, p.charge - FLASHLIGHT_DRAIN * dt);
+      if (p.charge === 0) {
+        // Out of power: the light is off until they load a fresh battery.
+        p.flags &= ~F_LIGHT;
+        this.event({ k: 'dead-battery', id: p.id });
+      }
+    }
   }
 
   updateMonster(m, dt) {
@@ -728,17 +815,20 @@ class Session {
   // --- Outbound ------------------------------------------------------------
 
   sendSnapshot() {
-    // Player rows: [id, x, y, z, yaw, flags, state, carrying, downTimer]
+    // Player rows:
+    //   [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
     const players = [];
     for (const p of this.players.values()) {
       players.push([
         p.id,
         round2(p.x), round2(p.y), round2(p.z),
-        round2(p.yaw),
+        round2(p.yaw), round2(p.pitch),
         p.flags,
         p.state,
         p.carrying === null ? -1 : p.carrying,
         p.state === ST_DOWN ? Math.max(0, Math.round(p.downTimer)) : 0,
+        Math.round(p.charge),
+        p.reserve,
       ]);
     }
     this.broadcast({
@@ -750,8 +840,11 @@ class Session {
       m: this.monsters.map((m) => [m.id, round2(m.x), round2(m.z), round2(m.yaw), MONSTER_STATE_CODE[m.state] ?? 0]),
       // Fuse rows: [id, x, z, state, holder]
       f: this.fuses.map((f) => [f.id, round2(f.x), round2(f.z), f.state, f.holder ?? -1]),
+      // Battery rows: [id, x, z, taken]
+      b: this.batteries.map((b) => [b.id, round2(b.x), round2(b.z), b.taken ? 1 : 0]),
       g: this.powered,
       x: this.exitOpen ? 1 : 0,
+      o: this.generatorOn ? 1 : 0,
     });
   }
 

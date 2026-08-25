@@ -2,7 +2,7 @@
 //
 // All of it is DOM: a grain tile, a vignette, a colour flash. Doing this in CSS
 // rather than a post-processing chain keeps the render path to a single pass,
-// which matters because the torch already costs a shadow map.
+// which matters because the flashlight already costs a shadow map.
 
 import { noiseDataURL } from './textures.js';
 

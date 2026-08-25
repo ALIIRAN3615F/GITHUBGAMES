@@ -109,7 +109,7 @@ export class Net {
 
   // Rate-limited: the server runs at 30 Hz and interpolates, so flooding it at
   // display refresh would just burn bandwidth on a shared Wi-Fi link.
-  sendInput(position, yaw, flags) {
+  sendInput(position, yaw, pitch, flags) {
     const now = performance.now();
     if (now - this.lastInputSent < 1000 / INPUT_HZ) return;
     this.lastInputSent = now;
@@ -117,11 +117,13 @@ export class Net {
       t: 'input',
       p: [round(position.x), round(position.y), round(position.z)],
       y: round(yaw),
+      pt: round(pitch),
       f: flags,
     });
   }
 
   use(kind, id) { this.send({ t: 'use', k: kind, id }); }
+  reload() { this.send({ t: 'use', k: 'reload' }); }
   chat(text) { this.send({ t: 'chat', m: text }); }
   setConfig(cfg) { this.send({ t: 'cfg', ...cfg }); }
   start() { this.send({ t: 'start' }); }
