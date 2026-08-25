@@ -300,6 +300,203 @@ export function exitSign(size = 256) {
 }
 
 // A soft flame gradient, scrolled and scaled to fake fire cheaply.
+// The corrugated steel of a roller shutter. Repeats vertically, so scaling the
+// curtain and matching the repeat keeps every slat the same height.
+export function shutterSlats(size = 128) {
+  const { canvas, ctx } = makeCanvas(size);
+  const slats = 8;
+  const step = size / slats;
+  for (let i = 0; i < slats; i++) {
+    const y = i * step;
+    // Each slat is a shallow cylinder: bright along the crown, dark in the seam.
+    const grad = ctx.createLinearGradient(0, y, 0, y + step);
+    grad.addColorStop(0, '#3c4045');
+    grad.addColorStop(0.18, '#9aa2a8');
+    grad.addColorStop(0.55, '#767d83');
+    grad.addColorStop(0.92, '#4a4f55');
+    grad.addColorStop(1, '#24272b');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, y, size, step);
+  }
+  // Grime and streaks down the face.
+  const img = ctx.getImageData(0, 0, size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const n = fbm(x / size, y / size, 71, 3, 6);
+      const i = (y * size + x) * 4;
+      const k = 0.78 + n * 0.42;
+      img.data[i] *= k; img.data[i + 1] *= k; img.data[i + 2] *= k;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(canvas, 1);
+}
+
+// The label plate on the door's control panel. Two states, painted once each,
+// so switching between them is a material swap and never a repaint.
+export function panelLabel(on, size = 256) {
+  const { canvas, ctx } = makeCanvas(size);
+  ctx.fillStyle = '#16181a';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#0c0e10';
+  ctx.fillRect(size * 0.06, size * 0.3, size * 0.88, size * 0.4);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold ' + Math.round(size * 0.13) + 'px monospace';
+  ctx.fillStyle = '#8a9099';
+  ctx.fillText('POWER', size * 0.5, size * 0.2);
+
+  ctx.font = 'bold ' + Math.round(size * 0.26) + 'px monospace';
+  ctx.fillStyle = on ? '#5dff8e' : '#ff3a24';
+  ctx.shadowColor = ctx.fillStyle;
+  ctx.shadowBlur = size * 0.09;
+  ctx.fillText(on ? 'ON' : 'OFF', size * 0.5, size * 0.5);
+  ctx.shadowBlur = 0;
+
+  ctx.font = 'bold ' + Math.round(size * 0.085) + 'px monospace';
+  ctx.fillStyle = '#6f757c';
+  ctx.fillText('BULKHEAD 07', size * 0.5, size * 0.83);
+  return finish(canvas, 1);
+}
+
+// --- The Backrooms ----------------------------------------------------------
+
+// Aged yellow wallpaper: the one texture that has to carry the whole place.
+export function backroomsWall(seed = 5, size = 256) {
+  const { canvas, ctx } = makeCanvas(size);
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const grain = fbm(u, v, seed, 4, 24);
+      const stain = fbm(u, v, seed + 91, 3, 3);
+      // Base is a dirty mustard; the stains pull it browner and darker.
+      const r = 214 + grain * 34 - stain * 58;
+      const g = 186 + grain * 30 - stain * 66;
+      const b = 104 + grain * 26 - stain * 52;
+      // Faint vertical seams every eighth of the tile: hung wallpaper.
+      const seam = Math.abs(((u * 8) % 1) - 0.5) > 0.485 ? 0.9 : 1;
+      const i = (y * size + x) * 4;
+      img.data[i] = r * seam;
+      img.data[i + 1] = g * seam;
+      img.data[i + 2] = b * seam;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(canvas, 1);
+}
+
+// Damp, flattened office carpet.
+export function backroomsCarpet(seed = 17, size = 256) {
+  const { canvas, ctx } = makeCanvas(size);
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const fibre = hash2(x, y, seed) * 0.35 + fbm(u, v, seed + 13, 3, 40) * 0.65;
+      const damp = fbm(u, v, seed + 55, 3, 2.5);
+      const i = (y * size + x) * 4;
+      img.data[i] = 152 + fibre * 46 - damp * 62;
+      img.data[i + 1] = 126 + fibre * 40 - damp * 60;
+      img.data[i + 2] = 74 + fibre * 30 - damp * 44;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(canvas, 1);
+}
+
+// Suspended ceiling tiles with the grid rails between them.
+export function backroomsCeiling(seed = 29, size = 256) {
+  const { canvas, ctx } = makeCanvas(size);
+  ctx.fillStyle = '#cbbe93';
+  ctx.fillRect(0, 0, size, size);
+  const img = ctx.getImageData(0, 0, size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const n = fbm(x / size, y / size, seed, 4, 30);
+      const i = (y * size + x) * 4;
+      const k = 0.82 + n * 0.3;
+      img.data[i] *= k; img.data[i + 1] *= k; img.data[i + 2] *= k;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  // The T-bar grid.
+  ctx.fillStyle = '#8d8468';
+  const rail = Math.max(2, size * 0.024);
+  ctx.fillRect(0, 0, size, rail);
+  ctx.fillRect(0, size / 2, size, rail);
+  ctx.fillRect(0, 0, rail, size);
+  ctx.fillRect(size / 2, 0, rail, size);
+  return finish(canvas, 1);
+}
+
+// The fluorescent panel itself: bright, slightly uneven, with the diffuser grid
+// showing through.
+export function fluorescentPanel(size = 128) {
+  const { canvas, ctx } = makeCanvas(size);
+  const grad = ctx.createLinearGradient(0, 0, 0, size);
+  grad.addColorStop(0, '#fff6d8');
+  grad.addColorStop(0.5, '#fffdf0');
+  grad.addColorStop(1, '#ffeec4');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = 'rgba(120,110,80,0.35)';
+  ctx.lineWidth = Math.max(1, size * 0.012);
+  for (let i = 1; i < 6; i++) {
+    const y = (i / 6) * size;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(size, y); ctx.stroke();
+  }
+  return finish(canvas, 1);
+}
+
+// --- The rifle ---------------------------------------------------------------
+
+// Laminated stock and handguard: orange-brown with a visible grain.
+export function gunWood(size = 128) {
+  const { canvas, ctx } = makeCanvas(size);
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      // Grain runs along the length: stretch the noise hard on one axis.
+      const grain = fbm(u * 0.35, v * 7, 61, 4, 9);
+      const ring = Math.sin((v * 26) + grain * 7) * 0.5 + 0.5;
+      const k = 0.72 + ring * 0.2 + grain * 0.24;
+      const i = (y * size + x) * 4;
+      img.data[i] = 168 * k + 48;
+      img.data[i + 1] = 96 * k + 26;
+      img.data[i + 2] = 46 * k + 12;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(canvas, 1);
+}
+
+// Worn parkerised steel for the receiver and barrel.
+export function gunMetal(size = 128) {
+  const { canvas, ctx } = makeCanvas(size);
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const n = fbm(u, v, 83, 4, 18);
+      const scuff = fbm(u * 3, v * 0.4, 97, 2, 12);
+      const k = 0.5 + n * 0.34 + (scuff > 0.72 ? 0.3 : 0);
+      const i = (y * size + x) * 4;
+      img.data[i] = 104 * k + 44;
+      img.data[i + 1] = 107 * k + 46;
+      img.data[i + 2] = 111 * k + 50;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(canvas, 1);
+}
+
 export function flameSprite(size = 128) {
   const { canvas, ctx } = makeCanvas(size);
   const g = ctx.createRadialGradient(size / 2, size * 0.68, 0, size / 2, size * 0.6, size * 0.5);

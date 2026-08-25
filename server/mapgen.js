@@ -12,6 +12,17 @@ const WALL_H = 3.4;    // wall height in world units
 
 const SIZES = { small: 23, medium: 31, large: 39 };
 
+// Grid cell values. Anything above 0 is open space of some kind; ROCK is the
+// only thing that is unconditionally solid.
+const ROCK = 0, FLOOR = 1, DOOR = 2, VESTIBULE = 3;
+
+// How deep the sealed passage behind the emergency door runs, in cells.
+const VESTIBULE_DEPTH = 3;
+
+// Half-width of the walkable opening in the door cell. The cell is CELL wide,
+// so this leaves a jamb either side that you cannot squeeze past.
+const APERTURE_HALF = 1.6;
+
 // How many spare flashlight batteries are hidden in the facility.
 const BATTERY_COUNT = 24;
 
@@ -45,7 +56,6 @@ function generate(opts = {}) {
   carveMaze(grid, w, h, rng);
   braid(grid, w, h, rng, 0.42);            // open dead ends so play is not a trap
   const rooms = carveRooms(grid, w, h, rng);
-  const floors = collectFloors(grid, w, h);
 
   // --- Objective placement -------------------------------------------------
   // Spawn in one room, then use walking distance (not straight-line) to spread
@@ -53,18 +63,35 @@ function generate(opts = {}) {
   rng.shuffle(rooms);
   const spawnRoom = rooms[0];
   const spawnCell = { cx: spawnRoom.cx, cy: spawnRoom.cy };
-  const distFromSpawn = bfsDistances(grid, w, h, spawnCell);
 
-  const maxDist = floors.reduce((m, c) => Math.max(m, distFromSpawn[idx(c.cx, c.cy, w)] ?? 0), 1);
+  const layoutDist = bfsDistances(grid, w, h, spawnCell);
+  const layoutFloors = collectFloors(grid, w, h);
+  const layoutMax = layoutFloors.reduce((m, c) => Math.max(m, layoutDist[idx(c.cx, c.cy, w)] ?? 0), 1);
 
   // Generator: a mid-distance hub, so every fuse run is a round trip.
-  const genRoom = pickRoom(rooms.slice(1), distFromSpawn, w, maxDist, 0.3, 0.65, rng) || rooms[1] || spawnRoom;
+  const genRoom = pickRoom(rooms.slice(1), layoutDist, w, layoutMax, 0.3, 0.65, rng) || rooms[1] || spawnRoom;
   // Exit: as far from the spawn as the facility goes.
-  const exitRoom = pickRoom(rooms.filter((r) => r !== genRoom && r !== spawnRoom), distFromSpawn, w, maxDist, 0.7, 1.01, rng)
+  const exitRoom = pickRoom(rooms.filter((r) => r !== genRoom && r !== spawnRoom), layoutDist, w, layoutMax, 0.7, 1.01, rng)
     || rooms[rooms.length - 1];
 
   const genCell = { cx: genRoom.cx, cy: genRoom.cy };
-  const exitCell = { cx: exitRoom.cx, cy: exitRoom.cy };
+
+  // The emergency door is bored through a wall rather than dropped into a room,
+  // so it is always an opening in a real wall with a sealed dead end behind it.
+  // See carveExitDoorway.
+  const doorway = carveExitDoorway(
+    grid, w, h,
+    doorCandidates(grid, w, h, exitRoom, layoutDist, layoutMax, rng),
+    rng,
+    protectedCells(w, h, [spawnCell, genCell])
+  );
+  const exitCell = doorway.door;
+
+  // Boring the passage can consume a cell or seal a flank, so everything that
+  // gets placed is placed against the layout as it finally stands.
+  const distFromSpawn = bfsDistances(grid, w, h, spawnCell);
+  const floors = collectFloors(grid, w, h);
+  const maxDist = floors.reduce((m, c) => Math.max(m, distFromSpawn[idx(c.cx, c.cy, w)] ?? 0), 1);
 
   const fuseCells = placeFuses(floors, distFromSpawn, w, maxDist, fuseCount, [spawnCell, genCell, exitCell], rng);
   const batteryCells = placeBatteries(floors, batteryCount, [spawnCell, genCell, exitCell, ...fuseCells], rng);
@@ -72,9 +99,13 @@ function generate(opts = {}) {
   // should be something you stumble on while exploring, not trip over.
   const gasCell = placeGasoline(floors, distFromSpawn, w, maxDist,
     [spawnCell, genCell, exitCell, ...fuseCells, ...batteryCells], rng);
+  // One rifle, somewhere in the middle distance. It is the only thing in the
+  // facility that can hurt what lives there, and there is only ever one.
+  const weaponCell = placeWeapon(floors, distFromSpawn, w, maxDist,
+    [spawnCell, genCell, exitCell, ...fuseCells, ...batteryCells, gasCell].filter(Boolean), rng);
 
   // --- Dressing ------------------------------------------------------------
-  const props = placeProps(grid, w, h, rooms, rng, [spawnCell, genCell, exitCell]);
+  const props = placeProps(grid, w, h, rooms, rng, [spawnCell, genCell, exitCell, doorway.approach]);
   const lamps = placeLamps(grid, w, h, rooms, rng);
 
   const spawnPoints = ringCells(grid, w, h, spawnCell, 8).map((c) => {
@@ -94,9 +125,15 @@ function generate(opts = {}) {
     spawnPoints,
     generator: worldPoint(genCell, w, h),
     exit: worldPoint(exitCell, w, h),
+    // Everything the door needs to be built and collided against identically
+    // on both ends: which cell it fills, which way it faces, how wide the
+    // opening is, where its control panel hangs, and where the passage behind
+    // it gives out into the Backrooms.
+    door: doorSpec(doorway, w, h),
     fuses: fuseCells.map((c, i) => ({ id: i, ...worldPoint(c, w, h) })),
     batteries: batteryCells.map((c, i) => ({ id: i, ...worldPoint(c, w, h) })),
     gasoline: gasCell ? worldPoint(gasCell, w, h) : null,
+    weapon: weaponCell ? worldPoint(weaponCell, w, h) : null,
     props,
     lamps,
     fuseCount,
@@ -126,6 +163,212 @@ function buildObstacles(props, genCell, w, h) {
 function worldPoint(cell, w, h) {
   const p = cellToWorld(cell.cx, cell.cy, w, h);
   return { x: p.x, z: p.z, cx: cell.cx, cy: cell.cy };
+}
+
+// --- The emergency doorway ---------------------------------------------------
+
+// A door has to be an opening in a wall, not a slab standing in a room. Rather
+// than hoping the maze happens to produce one, we bore it: pick a floor cell,
+// drill a short dead-end passage straight out from it, and wall in everything
+// the passage touches. The result is a door with solid rock on both flanks, a
+// sealed space behind, and no way around the sides - the passage exists only
+// because the door is there.
+//
+// Walling the flanks in can cut the maze in two, so every bore is applied
+// provisionally and rolled back unless the facility is still fully connected.
+function carveExitDoorway(grid, w, h, candidates, rng, protect) {
+  for (const depth of [VESTIBULE_DEPTH, 2, 1]) {
+    for (const from of candidates) {
+      const dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+      rng.shuffle(dirs);
+      for (const [dx, dy] of dirs) {
+        const plan = planBore(grid, w, h, from, dx, dy, depth, protect);
+        if (!plan) continue;
+        const undo = applyBore(grid, w, h, plan);
+        if (stillConnected(grid, w, h, from)) {
+          return describeDoorway(grid, w, h, from, dx, dy, plan.bore);
+        }
+        for (const [i, v] of undo) grid[i] = v;
+      }
+    }
+  }
+  throw new Error('mapgen: nowhere to put the emergency door');
+}
+
+// Works out which cells the passage occupies and which have to be walled in
+// around it, without touching anything yet.
+function planBore(grid, w, h, from, dx, dy, depth, protect) {
+  const px = dy, py = -dx;                 // perpendicular to the bore
+  const bore = [];
+  const seal = [];
+
+  // Cells that must end up solid. The outer shell of the map is off limits, as
+  // is anything protected (the spawn and the generator and their surrounds).
+  const wallIn = (cx, cy) => {
+    if (cx < 1 || cy < 1 || cx >= w - 1 || cy >= h - 1) return false;
+    if (protect.has(cx + ',' + cy)) return false;
+    if (grid[idx(cx, cy, w)] !== ROCK) seal.push({ cx, cy });
+    return true;
+  };
+
+  for (let step = 1; step <= depth + 1; step++) {
+    const cx = from.cx + dx * step, cy = from.cy + dy * step;
+    // Two cells of margin keeps the facility's outer shell intact.
+    if (cx < 2 || cy < 2 || cx >= w - 2 || cy >= h - 2) return null;
+    if (protect.has(cx + ',' + cy)) return null;
+    bore.push({ cx, cy });
+  }
+
+  // A dead end, not a through route.
+  if (!wallIn(from.cx + dx * (depth + 2), from.cy + dy * (depth + 2))) return null;
+  for (const c of bore) {
+    if (!wallIn(c.cx + px, c.cy + py)) return null;
+    if (!wallIn(c.cx - px, c.cy - py)) return null;
+  }
+  // ...including its corners, so nothing can be seen or squeezed past the end.
+  const last = bore[bore.length - 1];
+  if (!wallIn(last.cx + dx + px, last.cy + dy + py)) return null;
+  if (!wallIn(last.cx + dx - px, last.cy + dy - py)) return null;
+
+  return { bore, seal };
+}
+
+function applyBore(grid, w, h, plan) {
+  const undo = [];
+  const set = (cx, cy, v) => {
+    const i = idx(cx, cy, w);
+    undo.push([i, grid[i]]);
+    grid[i] = v;
+  };
+  for (const c of plan.seal) set(c.cx, c.cy, ROCK);
+  set(plan.bore[0].cx, plan.bore[0].cy, DOOR);
+  for (let i = 1; i < plan.bore.length; i++) set(plan.bore[i].cx, plan.bore[i].cy, VESTIBULE);
+  return undo;
+}
+
+// Every walkable cell still reachable on foot from the door's approach. The
+// passage itself is deliberately not counted: it is meant to be sealed off.
+function stillConnected(grid, w, h, from) {
+  let total = 0;
+  for (let i = 0; i < grid.length; i++) if (grid[i] === FLOOR) total++;
+
+  const seen = new Uint8Array(w * h);
+  const q = [from];
+  seen[idx(from.cx, from.cy, w)] = 1;
+  let reached = 1;
+  for (let k = 0; k < q.length; k++) {
+    const c = q[k];
+    for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
+      const cx = c.cx + dx, cy = c.cy + dy;
+      if (cx < 0 || cy < 0 || cx >= w || cy >= h) continue;
+      const i = idx(cx, cy, w);
+      if (seen[i] || grid[i] !== FLOOR) continue;
+      seen[i] = 1;
+      reached++;
+      q.push({ cx, cy });
+    }
+  }
+  return reached === total;
+}
+
+function describeDoorway(grid, w, h, from, dx, dy, bore) {
+  // The control panel hangs on the wall beside the door, on a side a player can
+  // actually stand next to.
+  const px = dy, py = -dx;
+  const standable = [1, -1].filter((s) => {
+    const cx = from.cx + px * s, cy = from.cy + py * s;
+    return cx >= 0 && cy >= 0 && cx < w && cy < h && grid[idx(cx, cy, w)] === FLOOR;
+  });
+  const side = standable.length ? standable[0] : 1;
+
+  return {
+    approach: from,
+    door: bore[0],
+    vestibule: bore.slice(1),
+    dir: { dx, dy },
+    panelCell: { cx: bore[0].cx + px * side, cy: bore[0].cy + py * side },
+  };
+}
+
+// Cells no bore may consume or wall in: the spawn, the generator, and the ring
+// around each so their interaction radius stays walkable.
+function protectedCells(w, h, cells) {
+  const out = new Set();
+  for (const c of cells) {
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) out.add((c.cx + dx) + ',' + (c.cy + dy));
+    }
+  }
+  return out;
+}
+
+// Candidate cells for the door, best first: the room the exit was assigned to,
+// then anywhere in the far half of the facility, then anywhere at all.
+function doorCandidates(grid, w, h, exitRoom, dist, maxDist, rng) {
+  const out = [];
+  const seen = new Set();
+  const push = (cx, cy) => {
+    const key = cx + ',' + cy;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ cx, cy });
+  };
+
+  if (exitRoom) {
+    const room = [];
+    for (let y = exitRoom.y; y < exitRoom.y + exitRoom.h; y++) {
+      for (let x = exitRoom.x; x < exitRoom.x + exitRoom.w; x++) {
+        if (grid[idx(x, y, w)] === FLOOR) room.push({ cx: x, cy: y });
+      }
+    }
+    rng.shuffle(room);
+    for (const c of room) push(c.cx, c.cy);
+  }
+
+  const far = [];
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      if (grid[idx(x, y, w)] !== FLOOR) continue;
+      const d = dist[idx(x, y, w)];
+      if (d >= 0) far.push({ cx: x, cy: y, d });
+    }
+  }
+  far.sort((a, b) => b.d - a.d);
+  for (const c of far) if (c.d >= maxDist * 0.45) push(c.cx, c.cy);
+  for (const c of far) push(c.cx, c.cy);
+  return out;
+}
+
+// Flattened for the wire: both ends build and collide the door from this.
+function doorSpec(d, w, h) {
+  const at = cellToWorld(d.door.cx, d.door.cy, w, h);
+  const approach = cellToWorld(d.approach.cx, d.approach.cy, w, h);
+  const last = d.vestibule[d.vestibule.length - 1];
+  const end = cellToWorld(last.cx, last.cy, w, h);
+  const flank = cellToWorld(d.panelCell.cx, d.panelCell.cy, w, h);
+
+  return {
+    cx: d.door.cx, cy: d.door.cy,
+    x: +at.x.toFixed(2), z: +at.z.toFixed(2),
+    // Outward normal, pointing from the facility into the passage. Grid dx/dy
+    // map straight onto world x/z, so this is both at once.
+    nx: d.dir.dx, nz: d.dir.dy,
+    // Half-width of the opening, and the axis it spans.
+    half: APERTURE_HALF,
+    height: WALL_H - 0.4,
+    approach: { x: +approach.x.toFixed(2), z: +approach.z.toFixed(2) },
+    // Where the passage gives out. Crossing this is the way into the Backrooms.
+    threshold: { x: +end.x.toFixed(2), z: +end.z.toFixed(2) },
+    vestibule: d.vestibule.map((c) => ({ cx: c.cx, cy: c.cy })),
+    // The control panel, set into the wall beside the door and facing back
+    // into the facility.
+    panel: {
+      x: +(flank.x - d.dir.dx * (CELL / 2 - 0.08)).toFixed(2),
+      z: +(flank.z - d.dir.dy * (CELL / 2 - 0.08)).toFixed(2),
+      y: 1.36,
+      yaw: +Math.atan2(-d.dir.dx, -d.dir.dy).toFixed(3),
+    },
+  };
 }
 
 // --- Maze ------------------------------------------------------------------
@@ -278,6 +521,20 @@ function placeGasoline(floors, dist, w, maxDist, avoid, rng) {
   return rng.pick(candidates);
 }
 
+// The rifle sits at a middle distance: far enough that going for it is a
+// decision, near enough that it is not the last thing you ever find.
+function placeWeapon(floors, dist, w, maxDist, avoid, rng) {
+  for (const [lo, hi] of [[0.3, 0.7], [0.2, 0.85], [0, 1.01]]) {
+    const candidates = floors.filter((c) => {
+      const d = dist[idx(c.cx, c.cy, w)];
+      if (d < 0 || d < maxDist * lo || d > maxDist * hi) return false;
+      return !avoid.some((a) => Math.abs(a.cx - c.cx) + Math.abs(a.cy - c.cy) < 4);
+    });
+    if (candidates.length) return rng.pick(candidates);
+  }
+  return null;
+}
+
 function placeBatteries(floors, count, avoid, rng) {
   const candidates = floors.filter((c) =>
     !avoid.some((a) => Math.abs(a.cx - c.cx) + Math.abs(a.cy - c.cy) < 2));
@@ -395,4 +652,7 @@ function placeLamps(grid, w, h, rooms, rng) {
   return lamps;
 }
 
-module.exports = { generate, BATTERY_COUNT, cellToWorld, worldToCell, bfsDistances, CELL, WALL_H, SIZES, idx };
+module.exports = {
+  generate, BATTERY_COUNT, cellToWorld, worldToCell, bfsDistances,
+  CELL, WALL_H, SIZES, idx, ROCK, FLOOR, DOOR, VESTIBULE, APERTURE_HALF,
+};

@@ -8,14 +8,19 @@
 // machines - the monster, the fuses, the generator, downs and revives.
 //
 // Wire protocol
-//   C -> S  join {name} | input {p,y,f} | use {k,id} | chat {m} | cfg {...}
-//           ready {} | start {} | ping {c}
+//   C -> S  join {name} | input {p,y,pt,f} | use {k,id} | shoot {d} | rl {}
+//           chat {m} | cfg {...} | ready {} | start {} | ping {c}
 //   S -> C  hello | lobby | begin {map} | snap | ev | chat | end | pong
 //
 // Player flag bits packed into `f` on the input message:
 const F_MOVING = 1, F_SPRINT = 2, F_CROUCH = 4, F_LIGHT = 8, F_BUSY = 16;
+// Weapon and climb state ride the same field so remote clients can pose a
+// player correctly from a snapshot alone.
+const F_GUN = 32, F_RELOAD = 64, F_CLIMB = 128;
+const CLIENT_FLAGS = F_MOVING | F_SPRINT | F_CROUCH | F_LIGHT | F_BUSY;
 
-const { generate, worldToCell, bfsDistances, idx } = require('./mapgen');
+const { generate, worldToCell, bfsDistances, idx, DOOR } = require('./mapgen');
+const BACKROOMS = require('./backrooms');
 const { findPath, hasLineOfSight } = require('./pathfind');
 const { makeRng } = require('./rng');
 
@@ -52,6 +57,38 @@ const SEARCH_TIME = 14;         // how long it hunts around a last known positio
 const UNSTABLE_TIME = 8;        // generator labouring, sparking, before it goes
 const BURN_TIME = 20;           // the facility burning before the ending lands
 
+// The emergency door. It is a roller shutter on a slow industrial motor, and
+// once it is up it stays up - nothing in the round puts it back down.
+const DOOR_OPEN_TIME = 6.5;
+const DOOR_SHUT = 0, DOOR_OPENING = 1, DOOR_OPEN = 2;
+
+// Zones. A player is either in the facility or through the door; the monster
+// only exists in the facility.
+const Z_FACILITY = 0, Z_BACKROOMS = 1;
+
+// Climbing the ladder out is a fixed, uninterruptible move, not a teleport.
+const CLIMB_TIME = 5.0;
+
+// The rifle. One in the facility, sixty rounds in total, and nothing anywhere
+// that tops it back up: enough to buy your way past the monster twice if every
+// shot lands, and nowhere near enough to hunt it.
+const MAG_SIZE = 30;
+const AMMO_RESERVE = 30;
+const FIRE_INTERVAL = 0.096;         // ~625 rpm
+// A client rendering at ten frames a second can only ask to fire ten times a
+// second, which would quietly halve the rifle's rate of fire on exactly the
+// machines that can least afford it. Instead the cadence is owed rather than
+// polled: a stuttering client may bank this much of it and catch up.
+const FIRE_CATCHUP = 0.58;
+const RELOAD_TIME = 2.6;
+const AK_RANGE = 60;
+const AK_DAMAGE_MONSTER = 12;
+const AK_DAMAGE_PLAYER = 26;
+const MONSTER_HP = 120;
+const MONSTER_DOWN_TIME = 55;        // how long a killed monster stays down
+const MONSTER_STAGGER = 0.35;        // seconds of flinch per hit
+const PLAYER_HP = 100;
+
 const DIFFICULTY = {
   calm:      { patrol: 2.0, chase: 4.05, hearing: 17, sight: 17, grace: 210, bleed: 60, monsters: 1, label: 'Calm' },
   normal:    { patrol: 2.4, chase: 4.70, hearing: 23, sight: 21, grace: 150, bleed: 45, monsters: 1, label: 'Normal' },
@@ -85,8 +122,11 @@ class Session {
     this.fire = 0;
     this.ending = null;
     this.powered = 0;
-    this.exitOpen = false;
     this.generatorOn = false;
+    this.door = { phase: DOOR_SHUT, timer: 0, by: null };
+    this.back = null;               // the Backrooms layout, once a round starts
+    this.backGrid = null;
+    this.weapon = null;
     this.tick = 0;
     this.roundTime = 0;
     this.endsAt = 0;
@@ -115,6 +155,9 @@ class Session {
       state: ST_ALIVE,
       x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
       flags: 0,
+      zone: Z_FACILITY,
+      hp: PLAYER_HP,
+      climb: 0,             // 0..1 up the ladder, > 0 means control is taken
       charge: 100,          // flashlight charge, 0-100
       reserve: 0,           // spare batteries carried
 
@@ -155,6 +198,7 @@ class Session {
     if (!player) return;
     if (player.carrying !== null) this.dropFuse(player);
     if (player.carryingGas) this.dropGasoline(player);
+    if (this.weapon && this.weapon.holder === player.id) this.dropWeapon(player);
     this.players.delete(id);
     if (this.hostId === id) this.hostId = this.players.keys().next().value ?? null;
     this.event({ k: 'left', name: player.name });
@@ -169,6 +213,8 @@ class Session {
     switch (msg.t) {
       case 'input':   return this.onInput(player, msg);
       case 'use':     return this.onUse(player, msg);
+      case 'shoot':   return this.onShoot(player, msg);
+      case 'rl':      return this.reloadWeapon(player);
       case 'chat':    return this.onChat(player, msg);
       case 'ready':   return this.onReady(player);
       case 'cfg':     return this.onConfig(player, msg);
@@ -188,6 +234,16 @@ class Session {
     const dt = Math.min(0.5, (now - player.lastInput) / 1000);
     player.lastInput = now;
 
+    // Aim is always the client's to give. Position is not, once the ladder has
+    // taken over: the climb is a fixed move and nothing about it is negotiable.
+    player.yaw = Number.isFinite(msg.y) ? msg.y : player.yaw;
+    if (Number.isFinite(msg.pt)) player.pitch = Math.max(-1.6, Math.min(1.6, msg.pt));
+
+    if (player.climb > 0) {
+      player.flags = (player.flags & ~CLIENT_FLAGS) | F_CLIMB;
+      return;
+    }
+
     // Movement clamp: allow a generous margin for latency spikes, but nothing
     // resembling a teleport.
     const budget = SPEED.sprint * 1.6 * dt + 0.6;
@@ -197,18 +253,20 @@ class Session {
       const s = budget / moved;
       player.x += dx * s;
       player.z += dz * s;
-    } else if (this.isSolidAt(nx, nz)) {
-      // Inside geometry - ignore and keep the last legal position.
+    } else if (this.isSolidAt(nx, nz, player.zone) || this.crossesSolid(player, nx, nz)) {
+      // Inside geometry, or a step that would pass through it on the way -
+      // ignore, and keep the last legal position.
     } else {
       player.x = nx;
       player.z = nz;
     }
+    // A player who has walked through the doorway must not still be standing in
+    // the facility as far as the server is concerned.
+    if (moved > 0) this.clampToAperture(player);
     player.y = Math.max(-2, Math.min(4, ny));
-    player.yaw = Number.isFinite(msg.y) ? msg.y : player.yaw;
-    // Pitch matters now: without it a remote flashlight beam is stuck level
-    // no matter where its owner is actually looking.
-    if (Number.isFinite(msg.pt)) player.pitch = Math.max(-1.6, Math.min(1.6, msg.pt));
-    player.flags = (msg.f | 0) & 31;
+    // The client owns stance and light; the server owns everything that can be
+    // claimed rather than chosen.
+    player.flags = (player.flags & ~CLIENT_FLAGS) | ((msg.f | 0) & CLIENT_FLAGS);
     if (player.state !== ST_ALIVE) player.flags &= ~(F_SPRINT | F_MOVING);
   }
 
@@ -218,13 +276,16 @@ class Session {
       case 'fuse':   return this.pickUpFuse(player, msg.id);
       case 'insert': return this.insertFuse(player);
       case 'revive': return this.revive(player, msg.id);
-      case 'exit':   return this.escape(player);
       case 'drop':   return this.dropFuse(player);
       case 'battery': return this.takeBattery(player, msg.id);
       case 'reload': return this.reloadFlashlight(player);
       case 'power':  return this.toggleGenerator(player);
       case 'gas':    return this.takeGasoline(player);
       case 'pour':   return this.pourGasoline(player);
+      case 'button': return this.pressDoorButton(player);
+      case 'weapon': return this.takeWeapon(player);
+      case 'dropgun': return this.dropWeapon(player);
+      case 'ladder': return this.startClimb(player);
       default:       return undefined;
     }
   }
@@ -280,11 +341,26 @@ class Session {
     this.gas = this.map.gasoline
       ? { x: this.map.gasoline.x, z: this.map.gasoline.z, state: 0, holder: null }
       : null;
+    this.gun = null;
+    this.weapon = this.map.weapon
+      ? {
+        x: this.map.weapon.x, z: this.map.weapon.z,
+        state: 0, holder: null,
+        mag: MAG_SIZE, reserve: AMMO_RESERVE,
+        nextShot: 0, reloading: 0,
+      }
+      : null;
+
+    // What is behind the door. Built up front so every client gets it with the
+    // map, and so nothing has to be generated at the moment of transition.
+    this.back = BACKROOMS.generate(this.map.seed);
+    this.backGrid = Uint8Array.from(this.back.grid, (c) => +c);
+
     this.sabotage = null;
     this.fire = 0;
     this.ending = null;
     this.powered = 0;
-    this.exitOpen = false;
+    this.door = { phase: DOOR_SHUT, timer: 0, by: null };
     this.generatorOn = false;
     this.roundTime = 0;
     this.outcome = null;
@@ -307,6 +383,10 @@ class Session {
       p.charge = 100;
       p.reserve = 0;
       p.carryingGas = false;
+      p.zone = Z_FACILITY;
+      p.hp = PLAYER_HP;
+      p.climb = 0;
+      p.flags = 0;
       this.placeAtSpawn(p);
     }
 
@@ -317,6 +397,7 @@ class Session {
     return {
       t: 'begin',
       map: this.map,
+      back: this.back,
       cfg: this.cfg,
       difficulty: this.difficulty().label,
       need: this.map.fuseCount,
@@ -345,6 +426,9 @@ class Session {
       timer: diff.grace + index * 15,
       exposure: new Map(),      // per-player seconds held in view
       searchTimer: 0,
+      hp: MONSTER_HP,
+      stagger: 0,
+      rage: 0,               // it comes back faster every time it is put down
       path: [], pathIdx: 0, repathIn: 0,
       targetId: null,
       lastKnown: null,
@@ -360,13 +444,24 @@ class Session {
     this.fuses = [];
     this.batteries = [];
     this.generatorOn = false;
+    this.door = { phase: DOOR_SHUT, timer: 0, by: null };
     this.gas = null;
+    this.weapon = null;
     this.sabotage = null;
     this.fire = 0;
     this.ending = null;
     this.map = null;
     this.grid = null;
-    for (const p of this.players.values()) { p.ready = false; p.state = ST_ALIVE; p.carrying = null; }
+    this.back = null;
+    this.backGrid = null;
+    for (const p of this.players.values()) {
+      p.ready = false;
+      p.state = ST_ALIVE;
+      p.carrying = null;
+      p.zone = Z_FACILITY;
+      p.climb = 0;
+      p.flags = 0;
+    }
     this.broadcastLobby();
   }
 
@@ -421,11 +516,12 @@ class Session {
 
     if (complete) {
       this.generatorOn = true;
-      this.exitOpen = true;
-      this.event({ k: 'door', locked: false, x: this.map.exit.x, z: this.map.exit.z });
-      this.event({ k: 'power', on: true, x: this.map.exit.x, z: this.map.exit.z });
+      // Power reaches the door's control panel. It does not open the door -
+      // somebody still has to walk over there and press the button.
+      this.event({ k: 'door-power', on: true, x: this.map.door.panel.x, z: this.map.door.panel.z });
+      this.event({ k: 'power', on: true, x: gen.x, z: gen.z });
       for (const m of this.monsters) {
-        if (m.state === 'sleeping' || m.state === 'waking') continue;
+        if (m.state === 'sleeping' || m.state === 'waking' || m.state === 'downed') continue;
         m.state = 'search';
         m.searchTimer = SEARCH_TIME;
         m.lastKnown = { x: gen.x, z: gen.z };
@@ -470,10 +566,10 @@ class Session {
     if (dist2(player.x, player.z, gen.x, gen.z) > 4.0 * 4.0) return;
 
     this.generatorOn = !this.generatorOn;
-    // The emergency door is wired to the same supply.
-    this.exitOpen = this.generatorOn;
     this.event({ k: 'power', on: this.generatorOn, by: player.name, x: gen.x, z: gen.z });
-    this.event({ k: 'door', locked: !this.generatorOn, x: this.map.exit.x, z: this.map.exit.z });
+    // The panel beside the door lights up or dies with the supply. A door that
+    // is already up stays up: the motor has done its work.
+    this.event({ k: 'door-power', on: this.generatorOn, x: this.map.door.panel.x, z: this.map.door.panel.z });
     // Throwing the switch either way is loud.
     this.hearNoise(gen.x, gen.z, 2.0);
   }
@@ -537,10 +633,11 @@ class Session {
       if (s.timer <= 0) {
         s.phase = 'burning';
         s.timer = BURN_TIME;
-        // The generator tears itself apart: no power, so no lit exit either.
+        // The generator tears itself apart, and the panel by the door goes dark
+        // with it. A shutter already raised stays raised.
         this.generatorOn = false;
-        this.exitOpen = false;
         this.fire = 0.001;
+        this.event({ k: 'door-power', on: false, x: this.map.door.panel.x, z: this.map.door.panel.z });
         this.event({ k: 'explosion', x: gen.x, z: gen.z });
         // Everything in the building hears that.
         for (const m of this.monsters) {
@@ -568,22 +665,320 @@ class Session {
     if (dist2(player.x, player.z, target.x, target.z) > 3.0 * 3.0) return;
     target.state = ST_ALIVE;
     target.downTimer = 0;
+    target.hp = PLAYER_HP;
     player.stats.revives++;
     this.event({ k: 'revive', by: player.name, who: target.name, id: target.id, x: target.x, z: target.z });
     this.hearNoise(target.x, target.z, 0.9);
   }
 
-  escape(player) {
-    if (player.state !== ST_ALIVE) return;
-    // The emergency door is an electrical lock: no power, no way out.
-    if (!this.generatorOn || !this.exitOpen) return;
-    const exit = this.map.exit;
-    if (dist2(player.x, player.z, exit.x, exit.z) > 4.5 * 4.5) return;
-    player.state = ST_ESCAPED;
-    player.stats.escaped = true;
-    player.carrying = null;
-    this.event({ k: 'escape', who: player.name, id: player.id });
-    this.checkRoundOver();
+  // --- The emergency door -----------------------------------------------------
+
+  // The button on the panel beside the door. Nothing else opens it: not the
+  // generator coming up, not standing near it, not the round ending.
+  pressDoorButton(player) {
+    if (player.state !== ST_ALIVE || player.zone !== Z_FACILITY) return;
+    if (this.door.phase !== DOOR_SHUT) return;
+    const panel = this.map.door.panel;
+    if (dist2(player.x, player.z, panel.x, panel.z) > 3.0 * 3.0) return;
+    if (!this.generatorOn) {
+      // Dead panel. Worth a click so the player knows they pressed it.
+      this.event({ k: 'door-dead', id: player.id, x: panel.x, z: panel.z });
+      return;
+    }
+
+    this.door.phase = DOOR_OPENING;
+    this.door.timer = DOOR_OPEN_TIME;
+    this.door.by = player.name;
+    this.event({
+      k: 'door-open', by: player.name, id: player.id,
+      seconds: DOOR_OPEN_TIME, x: this.map.door.x, z: this.map.door.z,
+    });
+    // Six seconds of motor and rattling steel, in a building with something
+    // listening in it.
+    this.hearNoise(this.map.door.x, this.map.door.z, 3.4);
+  }
+
+  updateDoor(dt) {
+    if (this.door.phase !== DOOR_OPENING) return;
+    this.door.timer -= dt;
+    if (this.door.timer > 0) return;
+    this.door.timer = 0;
+    this.door.phase = DOOR_OPEN;
+    this.event({ k: 'door-opened', x: this.map.door.x, z: this.map.door.z });
+  }
+
+  doorProgress() {
+    if (this.door.phase === DOOR_OPEN) return 1;
+    if (this.door.phase !== DOOR_OPENING) return 0;
+    return Math.max(0, Math.min(1, 1 - this.door.timer / DOOR_OPEN_TIME));
+  }
+
+  // --- Through the door --------------------------------------------------------
+
+  // Reaching the end of the passage behind the door. Not an ending - the round
+  // carries on, somewhere else.
+  updateTransitions() {
+    if (this.door.phase !== DOOR_OPEN || !this.back) return;
+    const t = this.map.door.threshold;
+    for (const p of this.players.values()) {
+      if (p.zone !== Z_FACILITY || p.state !== ST_ALIVE) continue;
+      if (dist2(p.x, p.z, t.x, t.z) > 2.4 * 2.4) continue;
+      this.enterBackrooms(p);
+    }
+  }
+
+  enterBackrooms(player) {
+    const entry = this.back.entry;
+    // Spread arrivals so two people never land inside each other.
+    const spread = ((player.id % 4) - 1.5) * 1.1;
+    player.zone = Z_BACKROOMS;
+    player.x = entry.x;
+    player.z = entry.z + spread;
+    player.y = 0;
+    player.yaw = entry.yaw;
+    // Nothing follows you through, and nothing you were carrying matters here.
+    // The rifle stays behind too - there is nothing to shoot on this side, and
+    // taking the only one out of the facility would strand whoever is left.
+    if (player.carrying !== null) this.dropFuse(player);
+    if (player.carryingGas) this.dropGasoline(player);
+    if (this.weapon && this.weapon.holder === player.id) this.dropWeapon(player);
+    for (const m of this.monsters) {
+      if (m.targetId === player.id) { m.targetId = null; m.lastKnown = null; }
+      m.exposure.delete(player.id);
+    }
+    this.event({
+      k: 'backrooms', id: player.id, who: player.name,
+      x: player.x, z: player.z, yaw: player.yaw,
+    });
+  }
+
+  // --- The ladder --------------------------------------------------------------
+
+  startClimb(player) {
+    if (player.state !== ST_ALIVE || player.zone !== Z_BACKROOMS) return;
+    if (player.climb > 0 || !this.back) return;
+    const l = this.back.ladder;
+    if (dist2(player.x, player.z, l.x, l.z) > 2.2 * 2.2) return;
+    // Snap to the rungs, then the climb owns the player until it finishes.
+    player.x = l.x - Math.sin(l.yaw) * 0.55;
+    player.z = l.z - Math.cos(l.yaw) * 0.55;
+    player.yaw = l.yaw;
+    player.climb = 0.0001;
+    player.flags = (player.flags & ~CLIENT_FLAGS) | F_CLIMB;
+    this.event({ k: 'climb', id: player.id, who: player.name, seconds: CLIMB_TIME });
+  }
+
+  updateClimbs(dt) {
+    if (!this.back) return;
+    for (const p of this.players.values()) {
+      if (p.climb <= 0) continue;
+      if (p.state !== ST_ALIVE) { p.climb = 0; p.flags &= ~F_CLIMB; continue; }
+      p.climb = Math.min(1, p.climb + dt / CLIMB_TIME);
+      p.y = this.back.ladder.top * p.climb;
+      if (p.climb < 1) continue;
+
+      // Into the vent. This is the way out.
+      p.climb = 0;
+      p.flags &= ~F_CLIMB;
+      p.state = ST_ESCAPED;
+      p.stats.escaped = true;
+      this.event({ k: 'vent', who: p.name, id: p.id });
+      this.checkRoundOver();
+    }
+  }
+
+  // --- The rifle ---------------------------------------------------------------
+
+  takeWeapon(player) {
+    if (player.state !== ST_ALIVE || !this.weapon || this.weapon.state !== 0) return;
+    if (player.zone !== Z_FACILITY) return;
+    if (dist2(player.x, player.z, this.weapon.x, this.weapon.z) > 3.2 * 3.2) return;
+    this.weapon.state = 1;
+    this.weapon.holder = player.id;
+    this.weapon.reloading = 0;
+    this.weapon.nextShot = this.roundTime;
+    player.flags |= F_GUN;
+    this.event({ k: 'gun-taken', by: player.name, id: player.id });
+    this.hearNoise(player.x, player.z, 0.4);
+  }
+
+  dropWeapon(player) {
+    if (!this.weapon || this.weapon.holder !== player.id) return;
+    this.weapon.state = 0;
+    this.weapon.holder = null;
+    this.weapon.reloading = 0;
+    this.weapon.x = player.x;
+    this.weapon.z = player.z;
+    player.flags &= ~(F_GUN | F_RELOAD);
+    this.event({ k: 'gun-dropped', x: this.weapon.x, z: this.weapon.z, id: player.id });
+  }
+
+  reloadWeapon(player) {
+    const gun = this.weapon;
+    if (!gun || gun.holder !== player.id || player.state !== ST_ALIVE) return;
+    if (gun.reloading > 0 || gun.mag >= MAG_SIZE || gun.reserve <= 0) return;
+    gun.reloading = RELOAD_TIME;
+    player.flags |= F_RELOAD;
+    this.event({ k: 'gun-reload', id: player.id, seconds: RELOAD_TIME });
+    this.hearNoise(player.x, player.z, 0.5);
+  }
+
+  updateWeapon(dt) {
+    const gun = this.weapon;
+    if (!gun || gun.reloading <= 0) return;
+    gun.reloading -= dt;
+    if (gun.reloading > 0) return;
+    gun.reloading = 0;
+    const holder = this.players.get(gun.holder);
+    const take = Math.min(MAG_SIZE - gun.mag, gun.reserve);
+    gun.mag += take;
+    gun.reserve -= take;
+    if (holder) holder.flags &= ~F_RELOAD;
+    this.event({ k: 'gun-reloaded', id: gun.holder, mag: gun.mag, reserve: gun.reserve });
+  }
+
+  // Every shot is judged here. The client sends where it was pointing; it does
+  // not get to say what it hit, how far the bullet travelled, or whether it had
+  // a round to fire in the first place.
+  onShoot(player, msg) {
+    if (this.phase !== 'playing' || player.state !== ST_ALIVE) return;
+    const gun = this.weapon;
+    if (!gun || gun.holder !== player.id || gun.reloading > 0) return;
+    if (!Array.isArray(msg.d) || msg.d.length !== 3) return;
+
+    // Rate limit first, so a client that spams cannot even generate events.
+    // Anything owed from before the catch-up window is forfeited, so a client
+    // that holds its fire cannot bank a magazine's worth of instant shots.
+    gun.nextShot = Math.max(gun.nextShot, this.roundTime - FIRE_CATCHUP);
+    if (this.roundTime < gun.nextShot) return;
+    gun.nextShot += FIRE_INTERVAL;
+
+    if (gun.mag <= 0) {
+      // Dry clicks are worth hearing, but not eleven times a second.
+      gun.nextShot = this.roundTime + 0.4;
+      this.event({ k: 'dry', id: player.id });
+      return;
+    }
+
+    const dir = normalise(msg.d);
+    if (!dir) return;
+    gun.mag--;
+
+    const eye = (player.flags & F_CROUCH) ? 1.02 : 1.62;
+    const origin = { x: player.x, y: eye, z: player.z };
+    const wall = this.rayWallDistance(origin, dir, AK_RANGE, player.zone);
+    const hit = this.rayTarget(origin, dir, wall, player);
+
+    const at = hit ? hit.t : wall;
+    this.event({
+      k: 'shot', id: player.id,
+      x: round2(origin.x), y: round2(origin.y), z: round2(origin.z),
+      dx: round2(dir.x), dy: round2(dir.y), dz: round2(dir.z),
+      d: round2(at),
+      h: hit ? hit.kind : 0,
+      mag: gun.mag,
+    });
+
+    if (hit && hit.kind === 1) this.damageMonster(hit.target, AK_DAMAGE_MONSTER, player);
+    if (hit && hit.kind === 2) this.damagePlayer(hit.target, AK_DAMAGE_PLAYER, player);
+
+    // A rifle going off in a concrete building is the loudest thing in the game.
+    this.hearNoise(player.x, player.z, 4.0);
+    for (const m of this.monsters) {
+      if (m.state !== 'sleeping') continue;
+      // It does not sleep through gunfire, wherever it was in its own good time.
+      m.timer = Math.min(m.timer, 10);
+    }
+  }
+
+  // Marches the shot through the grid and returns how far it gets before it
+  // buries itself in something solid.
+  rayWallDistance(origin, dir, maxDist, zone) {
+    const step = 0.22;
+    for (let t = step; t <= maxDist; t += step) {
+      const x = origin.x + dir.x * t;
+      const z = origin.z + dir.z * t;
+      const y = origin.y + dir.y * t;
+      if (y <= 0.02 || y >= this.zoneHeight(zone)) return t;
+      if (this.isSolidAt(x, z, zone)) return t;
+    }
+    return maxDist;
+  }
+
+  // The nearest body the shot passes through on its way to the wall. Monsters
+  // and survivors alike: there is no friendly-fire exemption.
+  rayTarget(origin, dir, maxDist, shooter) {
+    const horiz = Math.hypot(dir.x, dir.z);
+    let best = null;
+
+    const test = (tx, tz, radius, base, height, kind, target) => {
+      if (horiz < 1e-4) return;
+      const t = ((tx - origin.x) * dir.x + (tz - origin.z) * dir.z) / (horiz * horiz);
+      if (t <= 0.4 || t > maxDist) return;
+      const px = origin.x + dir.x * t, pz = origin.z + dir.z * t;
+      if (Math.hypot(px - tx, pz - tz) > radius) return;
+      const py = origin.y + dir.y * t;
+      if (py < base || py > base + height) return;
+      if (!best || t < best.t) best = { t, kind, target };
+    };
+
+    if (shooter.zone === Z_FACILITY) {
+      for (const m of this.monsters) {
+        if (m.state === 'downed') continue;
+        test(m.x, m.z, 0.62, 0, 2.3, 1, m);
+      }
+    }
+    for (const p of this.players.values()) {
+      if (p.id === shooter.id || p.zone !== shooter.zone) continue;
+      if (p.state !== ST_ALIVE && p.state !== ST_DOWN) continue;
+      const crouched = (p.flags & F_CROUCH) !== 0;
+      test(p.x, p.z, 0.42, 0, crouched ? 1.25 : 1.85, 2, p);
+    }
+    return best;
+  }
+
+  damageMonster(m, amount, shooter) {
+    if (m.state === 'downed') return;
+    m.hp -= amount;
+    m.stagger = MONSTER_STAGGER;
+    // Being shot tells it exactly where you are. That is the trade.
+    m.lastKnown = { x: shooter.x, z: shooter.z };
+    m.exposure.set(shooter.id, 99);
+
+    if (m.hp > 0) {
+      if (m.state === 'sleeping' || m.state === 'waking') {
+        m.state = 'waking';
+        m.timer = Math.min(m.timer, 2);
+      } else if (m.state !== 'chase' && m.state !== 'attack') {
+        m.state = 'chase';
+        m.targetId = shooter.id;
+        m.loseTimer = LOSE_GRACE;
+        m.repathIn = 0;
+      }
+      this.event({ k: 'monster-hit', id: m.id, x: round2(m.x), z: round2(m.z), hp: Math.max(0, m.hp) });
+      return;
+    }
+
+    // Put down, not killed. It gets back up, and it is faster afterwards.
+    m.state = 'downed';
+    m.timer = MONSTER_DOWN_TIME;
+    m.path = [];
+    m.targetId = null;
+    m.lastKnown = null;
+    m.exposure.clear();
+    this.event({ k: 'monster-down', id: m.id, x: round2(m.x), z: round2(m.z), by: shooter.name });
+  }
+
+  damagePlayer(target, amount, shooter) {
+    if (target.state !== ST_ALIVE) return;
+    target.hp -= amount;
+    this.event({
+      k: 'friendly', id: target.id, by: shooter.name, who: target.name,
+      hp: Math.max(0, target.hp), x: round2(target.x), z: round2(target.z),
+    });
+    if (target.hp > 0) return;
+    target.hp = 0;
+    this.downPlayer(target, null);
   }
 
   downPlayer(player, monster) {
@@ -595,8 +990,12 @@ class Session {
     player.downs++;
     // Each rescue buys less time than the last: the third mistake is usually fatal.
     player.downTimer = this.difficulty().bleed * Math.pow(0.72, player.downs - 1);
+    player.hp = 0;
+    player.climb = 0;
+    player.flags &= ~F_CLIMB;
     if (player.carrying !== null) this.dropFuse(player);
     if (player.carryingGas) this.dropGasoline(player);
+    if (this.weapon && this.weapon.holder === player.id) this.dropWeapon(player);
     this.event({ k: 'down', who: player.name, id: player.id, x: player.x, z: player.z });
     if (monster) {
       monster.state = 'retreat';
@@ -661,6 +1060,10 @@ class Session {
     }
 
     this.updateSabotage(dt);
+    this.updateDoor(dt);
+    this.updateTransitions();
+    this.updateClimbs(dt);
+    this.updateWeapon(dt);
     this.drainFlashlights(dt);
     for (const m of this.monsters) this.updateMonster(m, dt);
     this.updateDirector(dt);
@@ -727,12 +1130,28 @@ class Session {
   updateMonster(m, dt) {
     const diff = this.difficulty();
     const aggro = this.map.fuseCount ? this.powered / this.map.fuseCount : 0;
-    const speedMul = 1 + aggro * 0.16;
+    // Rage is what a magazine buys you: it comes back harder each time.
+    const speedMul = (1 + aggro * 0.16) * (1 + m.rage * 0.1);
     const hearing = diff.hearing * (1 + aggro * 0.4);
     const sight = diff.sight * (1 + aggro * 0.2);
 
     m.attackCooldown = Math.max(0, m.attackCooldown - dt);
     m.screamCooldown = Math.max(0, m.screamCooldown - dt);
+    m.stagger = Math.max(0, m.stagger - dt);
+
+    // --- Put down by gunfire -------------------------------------------------
+    if (m.state === 'downed') {
+      m.timer -= dt;
+      if (m.timer <= 0) {
+        m.state = 'waking';
+        m.timer = WAKE_DURATION * 0.6;
+        m.hp = MONSTER_HP;
+        m.rage = Math.min(4, m.rage + 1);
+        m.path = [];
+        this.event({ k: 'monster-rise', id: m.id, x: round2(m.x), z: round2(m.z) });
+      }
+      return;
+    }
 
     // --- Sleeping: the exploration phase ------------------------------------
     if (m.state === 'sleeping') {
@@ -761,6 +1180,8 @@ class Session {
     let best = null;
     for (const p of this.players.values()) {
       if (p.state !== ST_ALIVE && p.state !== ST_DOWN) continue;
+      // Nothing on the other side of the door registers at all.
+      if (p.zone !== Z_FACILITY) continue;
       const info = this.perceive(m, p, hearing, sight);
       if (!info.heard && !info.seen) {
         // Exposure decays while it cannot see you, so slipping behind a crate
@@ -858,7 +1279,8 @@ class Session {
       case 'chase': {
         speed = diff.chase * speedMul;
         const target = this.players.get(m.targetId);
-        if (!target || (target.state !== ST_ALIVE && target.state !== ST_DOWN)) {
+        if (!target || target.zone !== Z_FACILITY ||
+            (target.state !== ST_ALIVE && target.state !== ST_DOWN)) {
           m.state = 'search'; m.searchTimer = SEARCH_TIME; m.repathIn = 0; break;
         }
 
@@ -923,7 +1345,7 @@ class Session {
         m.state = 'patrol';
     }
 
-    this.moveAlongPath(m, speed, dt);
+    this.moveAlongPath(m, m.stagger > 0 ? speed * 0.15 : speed, dt);
   }
 
   // A cell within `radius` of the monster's last known point, for casting about
@@ -1050,17 +1472,83 @@ class Session {
     return { x: outX, z: outZ };
   }
 
-  isSolidAt(x, z) {
+  // --- Zones ------------------------------------------------------------------
+
+  // Which grid a body is standing on, and how it is laid out. One coordinate
+  // space covers both zones - the Backrooms simply live somewhere else in it -
+  // so a position alone is never ambiguous.
+  zoneOf(zone) {
+    if (zone === Z_BACKROOMS && this.back) {
+      return { grid: this.backGrid, w: this.back.w, h: this.back.h, cell: this.back.cell, back: true };
+    }
+    return { grid: this.grid, w: this.map.w, h: this.map.h, cell: this.map.cell, back: false };
+  }
+
+  zoneHeight(zone) {
+    return zone === Z_BACKROOMS && this.back ? this.back.wallH : (this.map ? this.map.wallH : 3.4);
+  }
+
+  cellOf(x, z, zone) {
+    const g = this.zoneOf(zone);
+    if (g.back) {
+      const c = BACKROOMS.worldToCell(x, z);
+      return { ...c, g };
+    }
+    return { ...worldToCell(x, z, g.w, g.h), g };
+  }
+
+  centreOf(cx, cy, zone) {
+    const g = this.zoneOf(zone);
+    if (g.back) return BACKROOMS.cellToWorld(cx, cy);
+    return { x: (cx - (g.w - 1) / 2) * g.cell, z: (cy - (g.h - 1) / 2) * g.cell };
+  }
+
+  isSolidAt(x, z, zone = Z_FACILITY) {
     if (!this.grid) return false;
-    const c = worldToCell(x, z, this.map.w, this.map.h);
-    if (c.cx < 0 || c.cy < 0 || c.cx >= this.map.w || c.cy >= this.map.h) return true;
-    return this.grid[idx(c.cx, c.cy, this.map.w)] !== 1;
+    const { cx, cy, g } = this.cellOf(x, z, zone);
+    if (cx < 0 || cy < 0 || cx >= g.w || cy >= g.h) return true;
+    const v = g.grid[cy * g.w + cx];
+    if (v === 0) return true;
+    // The door cell is a wall right up until the shutter is all the way up.
+    if (!g.back && v === DOOR) return this.door.phase !== DOOR_OPEN;
+    return false;
+  }
+
+  // A budgeted step can be several metres long after a latency spike, which is
+  // long enough to clear a wall in one go if only the destination is checked.
+  // Walk the segment instead: a move is legal only if the whole of it is.
+  crossesSolid(player, nx, nz) {
+    const dx = nx - player.x, dz = nz - player.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.5) return false;                 // shorter than any wall is thick
+    const steps = Math.ceil(d / 0.4);
+    for (let i = 1; i < steps; i++) {
+      const t = i / steps;
+      if (this.isSolidAt(player.x + dx * t, player.z + dz * t, player.zone)) return true;
+    }
+    return false;
+  }
+
+  // The opening in the door cell is narrower than the cell, so a body cannot
+  // drift past the jambs and end up inside the wall beside the door. Applied on
+  // the server as well as the client, so a tampered client gains nothing.
+  clampToAperture(player) {
+    if (!this.map || !this.map.door || player.zone !== Z_FACILITY) return;
+    const d = this.map.door;
+    const { cx, cy } = worldToCell(player.x, player.z, this.map.w, this.map.h);
+    if (cx !== d.cx || cy !== d.cy) return;
+    const limit = d.half - 0.34;                      // player radius
+    if (d.nx !== 0) {
+      player.z = Math.max(d.z - limit, Math.min(d.z + limit, player.z));
+    } else {
+      player.x = Math.max(d.x - limit, Math.min(d.x + limit, player.x));
+    }
   }
 
   // A noise loud enough to be worth investigating pulls nearby monsters in.
   hearNoise(x, z, strength) {
     for (const m of this.monsters) {
-      if (m.state === 'sleeping' || m.state === 'waking') continue;
+      if (m.state === 'sleeping' || m.state === 'waking' || m.state === 'downed') continue;
       if (m.state === 'chase' || m.state === 'retreat' || m.state === 'attack') continue;
       const d = Math.hypot(m.x - x, m.z - z);
       if (d > this.difficulty().hearing * strength) continue;
@@ -1095,7 +1583,8 @@ class Session {
 
   sendSnapshot() {
     // Player rows:
-    //   [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
+    //   [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge,
+    //    reserve, zone, climb]
     const players = [];
     for (const p of this.players.values()) {
       players.push([
@@ -1108,6 +1597,8 @@ class Session {
         p.state === ST_DOWN ? Math.max(0, Math.round(p.downTimer)) : 0,
         Math.round(p.charge),
         p.reserve,
+        p.zone,
+        round2(p.climb),
       ]);
     }
     this.broadcast({
@@ -1123,8 +1614,17 @@ class Session {
       b: this.batteries.map((b) => [b.id, round2(b.x), round2(b.z), b.taken ? 1 : 0]),
       // Gasoline: [x, z, state, holder]. state 0 floor, 1 carried, 2 poured.
       gs: this.gas ? [round2(this.gas.x), round2(this.gas.z), this.gas.state, this.gas.holder ?? -1] : null,
+      // The rifle: [x, z, state, holder, mag, reserve, reloading]
+      wp: this.weapon ? [
+        round2(this.weapon.x), round2(this.weapon.z),
+        this.weapon.state, this.weapon.holder ?? -1,
+        this.weapon.mag, this.weapon.reserve,
+        this.weapon.reloading > 0 ? 1 : 0,
+      ] : null,
       g: this.powered,
-      x: this.exitOpen ? 1 : 0,
+      // The door: [phase, progress 0..1]. Phase is authoritative; progress is
+      // what drives the shutter on every client at once.
+      dr: [this.door.phase, Math.round(this.doorProgress() * 100) / 100],
       o: this.generatorOn ? 1 : 0,
       sb: this.sabotage ? this.sabotage.phase : null,
       fi: Math.round(this.fire * 100) / 100,
@@ -1157,6 +1657,7 @@ class Session {
 // client is concerned; waking is its own visible beat.
 const MONSTER_STATE_CODE = {
   sleeping: 0, patrol: 1, idle: 2, search: 3, chase: 4, retreat: 5, waking: 6, attack: 7,
+  downed: 8,
 };
 
 function sanitiseName(name, id) {
@@ -1165,6 +1666,15 @@ function sanitiseName(name, id) {
 }
 
 function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+
+// A unit vector from whatever a client sent, or null if it sent nonsense.
+function normalise(v) {
+  const [x, y, z] = v;
+  if (![x, y, z].every(Number.isFinite)) return null;
+  const len = Math.hypot(x, y, z);
+  if (len < 1e-4) return null;
+  return { x: x / len, y: y / len, z: z / len };
+}
 function round2(v) { return Math.round(v * 100) / 100; }
 function angleDelta(from, to) {
   let d = (to - from) % (Math.PI * 2);
@@ -1173,4 +1683,10 @@ function angleDelta(from, to) {
   return d;
 }
 
-module.exports = { Session, TICK_HZ, MAX_PLAYERS, DIFFICULTY, F_MOVING, F_SPRINT, F_CROUCH, F_LIGHT, F_BUSY, SPEED };
+module.exports = {
+  Session, TICK_HZ, MAX_PLAYERS, DIFFICULTY, SPEED,
+  F_MOVING, F_SPRINT, F_CROUCH, F_LIGHT, F_BUSY, F_GUN, F_RELOAD, F_CLIMB,
+  DOOR_SHUT, DOOR_OPENING, DOOR_OPEN, DOOR_OPEN_TIME,
+  Z_FACILITY, Z_BACKROOMS, CLIMB_TIME,
+  MAG_SIZE, AMMO_RESERVE, MONSTER_HP, PLAYER_HP, AK_DAMAGE_MONSTER, AK_DAMAGE_PLAYER, AK_RANGE,
+};

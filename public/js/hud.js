@@ -25,6 +25,13 @@ export class Hud {
       chargeVal: $('chargeVal'),
       reserveRow: $('reserveRow'),
       reserveVal: $('reserveVal'),
+      fade: $('fade'),
+      fadeNote: $('fadeNote'),
+      fadeSub: $('fadeSub'),
+      ammo: $('ammo'),
+      ammoMag: $('ammoMag'),
+      ammoReserve: $('ammoReserve'),
+      ammoState: $('ammoState'),
       carrying: $('carrying'),
       roster: $('roster'),
       pingVal: $('pingVal'),
@@ -56,6 +63,7 @@ export class Hud {
       endTitle: $('endTitle'),
       endSummary: $('endSummary'),
       endTable: $('endTable'),
+      endCredits: $('endCredits'),
       endCountdown: $('endCountdown'),
     };
 
@@ -232,6 +240,43 @@ export class Hud {
   }
 
   // Spare batteries carried. Updates the moment one is picked up or spent.
+  // The rifle's readout. Hidden entirely unless you are carrying it, so the
+  // corner stays quiet for everyone else.
+  setAmmo(armed, mag, reserve, reloading) {
+    if (this._armed !== armed) {
+      this._armed = armed;
+      this.el.ammo.hidden = !armed;
+    }
+    if (!armed) return;
+    if (this._mag !== mag) {
+      this._mag = mag;
+      this.el.ammoMag.textContent = String(mag);
+      this.el.ammo.classList.toggle('empty', mag === 0);
+    }
+    if (this._ammoReserve !== reserve) {
+      this._ammoReserve = reserve;
+      this.el.ammoReserve.textContent = String(reserve);
+    }
+    const state = reloading ? 'RELOADING' : mag === 0 ? (reserve > 0 ? 'PRESS R' : 'DRY') : '';
+    if (this._ammoState !== state) {
+      this._ammoState = state;
+      this.el.ammoState.textContent = state;
+    }
+  }
+
+  // One transition, one fade. Driven by a class so the browser animates it
+  // rather than the frame loop.
+  setFade(on, note = '', sub = '') {
+    if (this._fadeNote !== note) {
+      this._fadeNote = note;
+      this.el.fadeNote.textContent = note;
+      this.el.fadeSub.textContent = sub;
+    }
+    if (this._fade === on) return;
+    this._fade = on;
+    this.el.fade.classList.toggle('on', on);
+  }
+
   setReserve(count) {
     if (count === this.lastReserve) return;
     this.lastReserve = count;
@@ -399,20 +444,37 @@ export class Hud {
         `<td class="${cls}">${fate}</td><td>${p.fuses} fuses</td><td>${p.revives} saves</td>` +
         `<td>${p.downs} downs</td></tr>`;
     }).join('');
+
+    // Only the ending that actually finishes the game gets the closing card.
+    const finished = data.outcome === 'escaped' && escapedCount > 0;
+    this.el.endCredits.hidden = !finished;
+    if (finished) this.el.endCredits.innerHTML = CREDITS;
   }
 
   setEndCountdown(seconds) { this.el.endCountdown.textContent = String(Math.max(0, seconds)); }
 }
 
+// The closing card. There is nothing licensed in this game to credit: every
+// texture is painted into a canvas at load and every sound is synthesised from
+// oscillators at runtime, which is worth saying once, here.
+const CREDITS = [
+  '<b>SIGNAL LOST</b>',
+  'A co-op horror game for a local network',
+  'Every surface painted at load &middot; every sound synthesised at runtime',
+  'No assets, no downloads, no internet',
+  '&nbsp;',
+  'Thank you for playing',
+].join('<br>');
+
 // Ending text, kept together and adjustable.
 const ENDINGS = {
   escaped: {
-    title: 'ENDING 1 - ESCAPED',
+    title: 'ENDING 1 - THE VENT',
     tone: 'won',
     body: (out, total) =>
-      `${out} of ${total} made it to the surface.<br>` +
-      'The facility is still standing behind you, and still humming.<br>' +
-      'But you are out.',
+      `${out} of ${total} found the corridor, the ladder, and the way up.<br>` +
+      'The hum stops the moment the grille closes behind you.<br>' +
+      'Nobody will believe where you have been.',
   },
   burned: {
     title: 'ENDING 2 - BURNED',

@@ -124,6 +124,8 @@ export class Net {
 
   use(kind, id) { this.send({ t: 'use', k: kind, id }); }
   reload() { this.send({ t: 'use', k: 'reload' }); }
+  // Where the client was pointing. The server decides what that hit.
+  shoot(dir) { this.send({ t: 'shoot', d: [dir.x, dir.y, dir.z] }); }
   chat(text) { this.send({ t: 'chat', m: text }); }
   setConfig(cfg) { this.send({ t: 'cfg', ...cfg }); }
   start() { this.send({ t: 'start' }); }

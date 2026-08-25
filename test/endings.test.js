@@ -33,6 +33,16 @@ const run = (session, seconds) => {
   for (let i = 0; i < Math.round(seconds * 30); i++) session.update(1 / 30);
 };
 
+// Power the door's panel, press the button, and let the shutter finish.
+function openDoor(session, player) {
+  const panel = session.map.door.panel;
+  const at = { x: player.x, z: player.z };
+  player.x = panel.x; player.z = panel.z;
+  session.handle(player, { t: 'use', k: 'button' });
+  run(session, 7);
+  player.x = at.x; player.z = at.z;
+}
+
 // Seat every fuse, which brings the generator up.
 function powerUp(session, player) {
   for (const fuse of session.fuses) {
@@ -131,12 +141,14 @@ test('the sequence runs unstable, explodes, burns, then ends', () => {
   assert.strictEqual(session.outcome, 'burned', 'wrong ending');
 });
 
-test('the explosion kills the power and locks the exit', () => {
+test('the explosion kills the power, and a door already up stays up', () => {
   const { session, players } = startedSession(1);
   const [p] = players;
   powerUp(session, p);
   assert.strictEqual(session.generatorOn, true);
-  assert.strictEqual(session.exitOpen, true);
+
+  openDoor(session, p);
+  assert.strictEqual(session.door.phase, 2);
 
   p.x = session.gas.x; p.z = session.gas.z;
   session.handle(p, { t: 'use', k: 'gas' });
@@ -145,7 +157,9 @@ test('the explosion kills the power and locks the exit', () => {
   run(session, 9);
 
   assert.strictEqual(session.generatorOn, false, 'the generator kept running after exploding');
-  assert.strictEqual(session.exitOpen, false, 'the exit stayed powered');
+  // The shutter is mechanical and it has already done its work. Losing the
+  // supply must never strand somebody behind it.
+  assert.strictEqual(session.door.phase, 2, 'the explosion shut the door again');
 });
 
 test('the monster cannot interrupt a committed ending', () => {
@@ -166,35 +180,48 @@ test('the monster cannot interrupt a committed ending', () => {
 
 // --- Ending 1 -----------------------------------------------------------------
 
-test('the exit is locked without power and works with it', () => {
+test('the button does nothing without power, and everything with it', () => {
   const { session, players } = startedSession(1);
   const [p] = players;
-  const exit = session.map.exit;
+  const panel = session.map.door.panel;
 
-  p.x = exit.x; p.z = exit.z;
-  session.handle(p, { t: 'use', k: 'exit' });
-  assert.strictEqual(p.state, 0, 'escaped through an unpowered door');
+  p.x = panel.x; p.z = panel.z;
+  session.handle(p, { t: 'use', k: 'button' });
+  assert.strictEqual(session.door.phase, 0, 'the shutter moved on a dead panel');
+  assert.strictEqual(p.conn.events('door-dead').length, 1, 'no feedback from a dead panel');
 
   powerUp(session, p);
-  p.x = exit.x; p.z = exit.z;
-  session.handle(p, { t: 'use', k: 'exit' });
-  assert.strictEqual(p.state, 3, 'could not escape through a powered door');
-  assert.strictEqual(session.phase, 'ended');
-  assert.strictEqual(session.outcome, 'escaped');
+  p.x = panel.x; p.z = panel.z;
+  session.handle(p, { t: 'use', k: 'button' });
+  assert.strictEqual(session.door.phase, 1, 'the button did nothing with power on');
+  assert.strictEqual(session.phase, 'playing', 'pressing the button ended the round');
 });
 
-test('cutting the power re-locks the door mid-round', () => {
+test('the shutter cannot be pressed from across the room', () => {
+  const { session, players } = startedSession(1);
+  const [p] = players;
+  powerUp(session, p);
+  const panel = session.map.door.panel;
+  p.x = panel.x + 12; p.z = panel.z;
+  session.handle(p, { t: 'use', k: 'button' });
+  assert.strictEqual(session.door.phase, 0, 'pressed a button 12m away');
+});
+
+test('cutting the power afterwards does not close the door', () => {
   const { session, players } = startedSession(2);
   const [a, b] = players;
   powerUp(session, a);
+  openDoor(session, a);
 
   a.x = session.map.generator.x; a.z = session.map.generator.z;
   session.handle(a, { t: 'use', k: 'power' });
   assert.strictEqual(session.generatorOn, false);
+  assert.strictEqual(session.door.phase, 2, 'the door closed when the lights went out');
 
-  b.x = session.map.exit.x; b.z = session.map.exit.z;
-  session.handle(b, { t: 'use', k: 'exit' });
-  assert.strictEqual(b.state, 0, 'escaped after the power was cut');
+  // And the way through is still walkable for whoever is left behind.
+  b.x = session.map.door.threshold.x; b.z = session.map.door.threshold.z;
+  session.update(1 / 30);
+  assert.strictEqual(b.zone, 1, 'a teammate was stranded by the power going out');
 });
 
 // --- The two must stay distinct ------------------------------------------------
@@ -214,12 +241,13 @@ test('a powered generator does not turn the fuel can into an escape', () => {
   assert.notStrictEqual(session.outcome, 'escaped');
 });
 
-test('escaping first means the fire ending never happens', () => {
+test('getting out through the vent first means the fire ending never happens', () => {
   const { session, players } = startedSession(1);
   const [p] = players;
-  powerUp(session, p);
-  p.x = session.map.exit.x; p.z = session.map.exit.z;
-  session.handle(p, { t: 'use', k: 'exit' });
+  p.zone = 1;
+  p.x = session.back.ladder.x; p.z = session.back.ladder.z;
+  session.handle(p, { t: 'use', k: 'ladder' });
+  run(session, 5.2);
   assert.strictEqual(session.outcome, 'escaped');
 
   // Whatever happens afterwards must not overwrite the result.

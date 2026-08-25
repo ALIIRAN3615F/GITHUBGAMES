@@ -5,7 +5,8 @@ front, a zero-dependency Node WebSocket server on the back. One machine hosts, e
 else opens a URL. No install, no accounts, no internet required.
 
 > The power is out. Six fuses are scattered somewhere in the dark.
-> Feed them all to the generator, open the blast door, and get out.
+> Feed them all to the generator, find the panel beside the bulkhead, and press
+> the button. Whatever is on the other side of that door is not the surface.
 > Something else is down here, and it hunts by sound and by light.
 
 ---
@@ -49,9 +50,11 @@ Run on another port with `npm start -- --port 8081` (or set `PORT`).
 | `C` | crouch (toggle) — slow, and very hard to see |
 | `Ctrl` | hold to crouch |
 | `F` | flashlight on/off |
-| `E` | hold to interact (take fuse, seat fuse, take battery, throw the power switch, revive, escape) |
-| `R` | load a fresh battery into the flashlight |
+| `E` | hold to interact (take fuse, seat fuse, take battery, throw the power switch, press the door button, take the rifle, climb, revive) |
+| `Mouse 1` | fire the rifle, if you are carrying it |
+| `R` | reload — the rifle if it needs it, otherwise a fresh battery for the flashlight |
 | `Q` | drop the fuse you are carrying |
+| `G` | drop the rifle |
 | `T` | radio (text chat) |
 | `Tab` | scoreboard |
 | `Esc` | pause, settings, leave |
@@ -69,18 +72,37 @@ flashlight straight back to full - which is the compensation for hauling the mos
 dangerous object in the building across it.
 
 **The generator is a building-wide switch.** Seat every fuse and it starts,
-lighting the whole facility rather than just its own room, and opening the blast
-door. After that it stays a switch: anyone standing at it can cut the power and
-put the building back into darkness. Sometimes you will want to. The lights make
-you visible from a long way off, and the thing down here is drawn to them - but
-the blast door, once open, stays open.
+lighting the whole facility rather than just its own room. After that it stays a
+switch: anyone standing at it can cut the power and put the building back into
+darkness. Sometimes you will want to. The lights make you visible from a long way
+off, and the thing down here is drawn to them.
 
-**Two ways out.** Seat every fuse and the generator starts, which lights the
-building and throws the bolts on the emergency door - walk through it and you are
-out. Or find the gasoline can hidden in the far half of the facility, pour it into
-the generator, and take the other ending: the machine labours, sparks, and takes
-the building with it. The two never trigger each other, and the explosion cuts the
-power, so the door is not an escape hatch from your own decision.
+**The bulkhead does not open itself.** Power reaches a control panel set into the
+wall beside it, and the panel reads `POWER: OFF` until it does. Somebody still has
+to walk over there and press the button. Then a shutter motor takes six seconds to
+wind a roller door up out of the floor, in a building with something listening in
+it, and once it is up it stays up — cutting the power afterwards will not strand
+anyone behind it.
+
+**The door is not the ending.** Behind it is a short concrete passage, and at the
+end of that the wall has come away. What is on the other side is lit, yellow, and
+goes on for a long way. Nothing hunts you there. There is no marker, no objective
+text and nothing to fight: somewhere in the partitions there is one opening into a
+corridor a hundred metres long, and at the end of that a ladder to a vent in the
+ceiling. That is the way out.
+
+**There is one rifle.** An AK-47, somewhere in the middle distance of the
+facility, with thirty rounds in it and thirty more in reserve, and nothing
+anywhere that reloads it. It takes ten rounds to put the monster down, and it does
+not stay down — it gets back up in under a minute, and it is faster afterwards.
+A full loadout buys you six of those, if every round lands, which it will not.
+The rifle is there to buy a corridor, not to win a fight. Friendly fire is on, the
+server decides every hit, and four rounds will put a teammate on the floor.
+
+**Two endings.** Get through the bulkhead, find the corridor, climb the ladder and
+get into the vent — or find the gasoline can hidden in the far half of the
+facility, pour it into the generator, and take the other one: the machine labours,
+sparks, and takes the building with it. The two never trigger each other.
 
 **You get time first.** The monster sleeps for the opening minutes - two and a
 half on Normal - and nothing you do wakes it early. That window is for learning
@@ -94,8 +116,9 @@ generator, so the safest moment to run for the next one is the moment after some
 else has just finished.
 
 **It gets worse as you win.** Every fuse you seat makes it faster and sharpens its
-hearing. When the last fuse lands, the lights come up, the blast door opens — and it
-knows exactly where you are. The last run to the exit is meant to be a panic.
+hearing. When the last fuse lands the lights come up and it knows exactly where you
+are — and the walk to the door panel, and the six seconds of shutter motor after
+you press the button, are meant to be the worst of the round.
 
 **Nobody dies alone if you're quick.** Getting caught puts you down, bleeding out, and
 you drop whatever you were carrying. A teammate can reach you and hold `E`. Each rescue
@@ -110,15 +133,20 @@ how long you bleed. **Nightmare** puts two of them down there with you.
 server/
   index.js      static file server + WebSocket host, prints LAN addresses
   wsserver.js   RFC 6455 WebSocket implementation (handshake, framing, ping/pong)
-  game.js       authoritative session: monster AI, objectives, downs, revives
-  mapgen.js     procedural facility: braided maze, chambers, props, objectives
+  game.js       authoritative session: monster AI, objectives, the door, the
+                rifle and every shot fired, downs, revives, zones
+  mapgen.js     procedural facility: braided maze, chambers, props, objectives,
+                and the doorway bored through a wall with a sealed passage behind
+  backrooms.js  the second level: partitions, halls, the long corridor, the ladder
   pathfind.js   BFS routing and DDA line-of-sight on the grid
   rng.js        seeded PRNG, so a seed always rebuilds the same facility
 public/
   index.html    game shell and menus
   css/          interface styling
   js/main.js    renderer, round state machine, glue
-  js/world.js   level geometry, instanced walls and props, light budget
+  js/world.js   level geometry, instanced walls and props, the shutter, light budget
+  js/backrooms.js the second level: yellow walls, carpet, hundreds of fluorescents
+  js/weapon.js  the rifle, modelled and animated, drawn in its own render pass
   js/entities.js monster, survivors and fuses, with snapshot interpolation
   js/player.js  local movement, flashlight, stamina, nerve
   js/audio.js   every sound, synthesised at runtime
@@ -128,7 +156,12 @@ public/
   js/fx.js      grain, vignette, damage flash
   vendor/       three.js r160 (vendored so LAN play needs no internet)
 test/
-  logic.test.js server-side tests: map connectivity, framing, a full round
+  logic.test.js   map connectivity, WebSocket framing, a full round end to end
+  movement.test.js the movement transform, in isolation
+  collision.test.js walls, props and the doorway aperture
+  monster.test.js  perception: the exploration phase, crouching, no wallhacks
+  endings.test.js  the fuel can, the fire, and keeping the endings apart
+  overhaul.test.js the sealed doorway, the shutter, zones, the rifle, the vent
 ```
 
 **No asset files.** Every texture is drawn into a `<canvas>` at load, and every sound —
@@ -152,12 +185,16 @@ between frames.
 npm test
 ```
 
-30 tests, no dependencies, about a third of a second. They cover the things that break
-quietly: that every generated map keeps its generator, exit and every fuse reachable
-from the spawn (checked across 40 seeds and all three sizes), that the WebSocket codec
-survives split packets and 64-bit payload lengths, that objectives reject action at a
-distance, that a tampered client cannot teleport, and that a full round runs from spawn
-to extraction.
+106 tests, no dependencies, about a second. They cover the things that break quietly:
+that every generated map keeps its generator and every fuse reachable from the spawn,
+that the emergency doorway is always an opening in a real wall with rock on both flanks
+and a sealed dead end behind it, that boring that passage never cuts the facility in two
+(all checked across 60 seeds and all three sizes), that nothing can reach the far side
+before the shutter is up, that the WebSocket codec survives split packets and 64-bit
+payload lengths, that objectives reject action at a distance, that a tampered client
+cannot teleport or fire faster than the rifle can, that the monster never learns a
+position it cannot see or hear, and that a full round runs from the spawn through the
+door and out through the vent.
 
 ## Requirements
 

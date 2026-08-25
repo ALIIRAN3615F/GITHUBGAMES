@@ -55,6 +55,7 @@ export class Input {
     this.mouseDX = 0;
     this.mouseDY = 0;
     this.locked = false;
+    this.lastLook = { x: 0, y: 0 };
     this.sensitivity = 1;
     this.swallowNextMove = false;
     this.captureText = false;      // true while the chat box has focus
@@ -120,6 +121,8 @@ export class Input {
     const dx = clamp(this.mouseDX, -MAX_LOOK_PER_FRAME, MAX_LOOK_PER_FRAME);
     const dy = clamp(this.mouseDY, -MAX_LOOK_PER_FRAME, MAX_LOOK_PER_FRAME);
     this.mouseDX = 0; this.mouseDY = 0;
+    // Kept for the viewmodel, which lags the aim rather than tracking it.
+    this.lastLook = { x: dx, y: dy };
     return { dx, dy };
   }
 
@@ -214,6 +217,15 @@ export class LocalPlayer {
     this.shake = 0;
   }
 
+  // Moving a player without resetting them. Used for the one place the server
+  // repositions you mid-round: stepping through the door.
+  teleport(x, z) {
+    this.position.set(x, 0, z);
+    this.velocity.set(0, 0, 0);
+    this.shake = 0;
+    this.strideAccum = 0;
+  }
+
   look(input) {
     if (!input.locked) return;
     const { dx, dy } = input.takeLook();
@@ -295,6 +307,7 @@ export class LocalPlayer {
     }
 
     const planarSpeed = Math.hypot(this.velocity.x, this.velocity.z);
+    this.planarSpeed = planarSpeed;
     this.moving = planarSpeed > 0.35;
 
     // --- Footsteps ----------------------------------------------------------

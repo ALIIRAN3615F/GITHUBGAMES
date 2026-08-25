@@ -690,6 +690,292 @@ export class AudioEngine {
     this.loops.set('ending', { nodes, out });
   }
 
+  // --- The emergency door -----------------------------------------------------
+
+  // The button. A hard mechanical snap with a little spring under it.
+  buttonPress(x, z, dead = false) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const n = this.noiseSource(0.09, 1.6);
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = dead ? 1500 : 2600;
+    bp.Q.value = 2.4;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(dead ? 0.2 : 0.4, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+    n.connect(bp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.3, ref: 3 });
+
+    // A dead panel gives you the click and nothing else.
+    if (dead) return;
+    const o = this.ctx.createOscillator();
+    o.type = 'square';
+    o.frequency.setValueAtTime(180, t);
+    o.frequency.exponentialRampToValueAtTime(90, t + 0.05);
+    const og = this.ctx.createGain();
+    og.gain.setValueAtTime(0.14, t);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+    o.connect(og);
+    this.route(og, 1, x, z, { wet: 0.25, ref: 3 });
+    o.start(t); o.stop(t + 0.08);
+  }
+
+  // The whole opening sequence, laid out in one go so the layers stay in step
+  // with the shutter the server is driving: contactor, lock bolts, motor,
+  // rattling steel, and the clunk when it tops out.
+  doorSequence(x, z, seconds) {
+    if (!this.ready) return;
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime;
+
+    // A relay closing somewhere in the wall.
+    for (const [at, freq] of [[0.06, 320], [0.14, 240]]) {
+      const o = ctx.createOscillator();
+      o.type = 'square';
+      o.frequency.value = freq;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t0 + at);
+      g.gain.linearRampToValueAtTime(0.13, t0 + at + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + 0.07);
+      o.connect(g);
+      this.route(g, 1, x, z, { wet: 0.5, ref: 5 });
+      o.start(t0 + at); o.stop(t0 + at + 0.09);
+    }
+
+    // Lock bolts withdrawing: two heavy metal knocks.
+    for (const at of [0.35, 0.62]) {
+      const n = this.noiseSource(0.3, 0.45);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 260; bp.Q.value = 1.4;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t0 + at);
+      g.gain.linearRampToValueAtTime(0.42, t0 + at + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + 0.28);
+      n.connect(bp).connect(g);
+      this.route(g, 1, x, z, { wet: 0.75, ref: 6 });
+    }
+
+    // The motor: a loaded hum that starts, labours, and cuts out at the top.
+    const motorStart = 0.75;
+    const motorRun = Math.max(0.5, seconds - motorStart - 0.3);
+    const motorOut = ctx.createGain();
+    motorOut.gain.setValueAtTime(0.0001, t0 + motorStart);
+    motorOut.gain.linearRampToValueAtTime(0.3, t0 + motorStart + 0.35);
+    motorOut.gain.setValueAtTime(0.3, t0 + motorStart + motorRun - 0.25);
+    motorOut.gain.exponentialRampToValueAtTime(0.0001, t0 + motorStart + motorRun);
+    this.route(motorOut, 1, x, z, { wet: 0.5, ref: 7, rolloff: 0.9 });
+
+    for (const [type, freq, gain] of [['sawtooth', 48, 0.5], ['square', 96, 0.16], ['sawtooth', 143, 0.09]]) {
+      const o = ctx.createOscillator();
+      o.type = type;
+      o.frequency.setValueAtTime(freq * 0.82, t0 + motorStart);
+      o.frequency.linearRampToValueAtTime(freq, t0 + motorStart + 0.5);
+      // It drags a little under load, the way a real one does.
+      o.frequency.linearRampToValueAtTime(freq * 0.95, t0 + motorStart + motorRun);
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 620;
+      const g = ctx.createGain();
+      g.gain.value = gain;
+      o.connect(lp).connect(g).connect(motorOut);
+      o.start(t0 + motorStart);
+      o.stop(t0 + motorStart + motorRun + 0.1);
+    }
+
+    // Steel slats clattering through the guides for as long as it is moving.
+    const rattle = this.noiseSource(motorRun + 0.2, 0.9);
+    const rbp = ctx.createBiquadFilter();
+    rbp.type = 'bandpass'; rbp.frequency.value = 1700; rbp.Q.value = 0.8;
+    const rg = ctx.createGain();
+    rg.gain.setValueAtTime(0.0001, t0 + motorStart);
+    rg.gain.linearRampToValueAtTime(0.1, t0 + motorStart + 0.4);
+    rg.gain.setValueAtTime(0.1, t0 + motorStart + motorRun - 0.2);
+    rg.gain.exponentialRampToValueAtTime(0.0001, t0 + motorStart + motorRun);
+    rattle.connect(rbp).connect(rg);
+    this.route(rg, 1, x, z, { wet: 0.65, ref: 7 });
+
+    // Individual slats knocking as they come off the drum.
+    for (let at = motorStart + 0.3; at < motorStart + motorRun; at += 0.34) {
+      const n = this.noiseSource(0.1, 1.4);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 2200 + Math.random() * 900; bp.Q.value = 3;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t0 + at);
+      g.gain.linearRampToValueAtTime(0.06 + Math.random() * 0.04, t0 + at + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + 0.09);
+      n.connect(bp).connect(g);
+      this.route(g, 1, x, z, { wet: 0.6, ref: 7 });
+    }
+
+    // And the clunk when it reaches the top and the drum stops dead.
+    const end = t0 + seconds - 0.12;
+    const thump = ctx.createOscillator();
+    thump.type = 'sine';
+    thump.frequency.setValueAtTime(120, end);
+    thump.frequency.exponentialRampToValueAtTime(42, end + 0.3);
+    const tg = ctx.createGain();
+    tg.gain.setValueAtTime(0.001, end);
+    tg.gain.linearRampToValueAtTime(0.5, end + 0.01);
+    tg.gain.exponentialRampToValueAtTime(0.0001, end + 0.55);
+    thump.connect(tg);
+    this.route(tg, 1, x, z, { wet: 0.8, ref: 8 });
+    thump.start(end); thump.stop(end + 0.6);
+
+    const crash = this.noiseSource(0.5, 0.6);
+    const cbp = ctx.createBiquadFilter();
+    cbp.type = 'bandpass'; cbp.frequency.value = 900; cbp.Q.value = 0.7;
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(0.001, end);
+    cg.gain.linearRampToValueAtTime(0.3, end + 0.008);
+    cg.gain.exponentialRampToValueAtTime(0.0001, end + 0.45);
+    crash.connect(cbp).connect(cg);
+    this.route(cg, 1, x, z, { wet: 0.8, ref: 8 });
+  }
+
+  // --- The rifle ---------------------------------------------------------------
+
+  // A shot is four layers: the mechanical crack of the action, the muzzle blast,
+  // the supersonic snap, and the tail slapping back off the concrete. Every one
+  // is jittered per shot, so a magazine never sounds like one sample repeated.
+  gunshot(x, z, own = false) {
+    if (!this.ready) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const v = 0.88 + Math.random() * 0.24;          // per-shot variation
+    const level = own ? 1 : 0.85;
+
+    // Blast: a hard noise burst swept down.
+    const blast = this.noiseSource(0.4, 0.8 + Math.random() * 0.3);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(7000 * v, t);
+    lp.frequency.exponentialRampToValueAtTime(300, t + 0.22);
+    const bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.9 * level * v, t);
+    bg.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+    blast.connect(lp).connect(bg);
+    this.route(bg, 1, x, z, { wet: 0.55, ref: 12, rolloff: 0.7 });
+
+    // Body: a fast pitch drop that gives the shot its weight.
+    const body = ctx.createOscillator();
+    body.type = 'sawtooth';
+    body.frequency.setValueAtTime(220 * v, t);
+    body.frequency.exponentialRampToValueAtTime(48, t + 0.13);
+    const dist = ctx.createWaveShaper();
+    dist.curve = makeDistortion(24);
+    const yg = ctx.createGain();
+    yg.gain.setValueAtTime(0.42 * level, t);
+    yg.gain.exponentialRampToValueAtTime(0.0001, t + 0.17);
+    body.connect(dist).connect(yg);
+    this.route(yg, 1, x, z, { wet: 0.4, ref: 12, rolloff: 0.7 });
+    body.start(t); body.stop(t + 0.2);
+
+    // Crack: the very short, very bright transient on top.
+    const crack = this.noiseSource(0.06, 2.6);
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 3400;
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(0.5 * level * v, t);
+    cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.045);
+    crack.connect(hp).connect(cg);
+    this.route(cg, 1, x, z, { wet: 0.3, ref: 12 });
+
+    // Action: bolt cycling, a beat behind the shot.
+    const mech = this.noiseSource(0.12, 1.9);
+    const mbp = ctx.createBiquadFilter();
+    mbp.type = 'bandpass'; mbp.frequency.value = 2400 + Math.random() * 700; mbp.Q.value = 2.2;
+    const mg = ctx.createGain();
+    mg.gain.setValueAtTime(0.001, t + 0.03);
+    mg.gain.linearRampToValueAtTime(0.14 * level, t + 0.038);
+    mg.gain.exponentialRampToValueAtTime(0.0001, t + 0.13);
+    mech.connect(mbp).connect(mg);
+    this.route(mg, 1, x, z, { wet: 0.35, ref: 8 });
+
+    // Tail: the building answering back.
+    const tail = this.noiseSource(0.9, 0.35);
+    const tbp = ctx.createBiquadFilter();
+    tbp.type = 'bandpass'; tbp.frequency.value = 520; tbp.Q.value = 0.5;
+    const tg = ctx.createGain();
+    tg.gain.setValueAtTime(0.001, t + 0.02);
+    tg.gain.linearRampToValueAtTime(0.16 * level, t + 0.07);
+    tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.85);
+    tail.connect(tbp).connect(tg);
+    this.route(tg, 1, x, z, { wet: 0.95, ref: 20, rolloff: 0.5 });
+  }
+
+  // Hammer falling on an empty chamber.
+  dryFire(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const n = this.noiseSource(0.07, 2.2);
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 3100; bp.Q.value = 3.5;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.3, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    n.connect(bp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.25, ref: 4 });
+  }
+
+  // The reload, matched beat for beat to what the hands are doing on screen.
+  gunReload(x, z, seconds) {
+    if (!this.ready) return;
+    const t0 = this.ctx.currentTime;
+    const beats = [
+      [0.08, 1800, 0.22, 0.09],    // magazine catch released
+      [0.45, 900, 0.26, 0.16],     // magazine clear of the well
+      [1.25, 1400, 0.3, 0.12],     // fresh magazine offered up
+      [1.55, 700, 0.42, 0.18],     // rocked home
+      [1.85, 2600, 0.3, 0.1],      // charging handle back
+      [2.05, 1200, 0.44, 0.14],    // and released
+    ];
+    for (const [at, freq, gain, dur] of beats) {
+      if (at > seconds) continue;
+      const n = this.noiseSource(dur + 0.05, 1.2);
+      const bp = this.ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = freq * (0.94 + Math.random() * 0.12);
+      bp.Q.value = 2.6;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.001, t0 + at);
+      g.gain.linearRampToValueAtTime(gain, t0 + at + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + dur);
+      n.connect(bp).connect(g);
+      this.route(g, 1, x, z, { wet: 0.3, ref: 5 });
+    }
+  }
+
+  // A round finding something soft.
+  fleshHit(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const n = this.noiseSource(0.22, 0.5);
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 900;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.42, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+    n.connect(lp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.4, ref: 8 });
+  }
+
+  // And a round finding concrete.
+  ricochet(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const n = this.noiseSource(0.16, 1.8);
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(2600 + Math.random() * 1800, t);
+    bp.frequency.exponentialRampToValueAtTime(700, t + 0.14);
+    bp.Q.value = 6;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.3, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+    n.connect(bp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.5, ref: 10 });
+  }
+
   // --- Continuous layers ----------------------------------------------------
 
   // Room tone: sub rumble, a filtered hiss, and a slow beating between two
@@ -796,6 +1082,210 @@ export class AudioEngine {
     loop.pan.positionX.value = x;
     loop.pan.positionZ.value = z;
     loop.out.gain.setTargetAtTime(clamp(level, 0, 1) * 0.5, this.ctx.currentTime, 0.6);
+  }
+
+  // --- The Backrooms ----------------------------------------------------------
+
+  // The bed here is almost nothing: mains hum off the fluorescents, a distant
+  // air handler, and long stretches with neither. The silence is the point, so
+  // the sparse layers are scheduled minutes apart rather than seconded out.
+  startBackroomsAmbient() {
+    if (!this.ready || this.loops.has('backrooms')) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    const out = ctx.createGain();
+    out.gain.setValueAtTime(0.0001, t);
+    out.gain.exponentialRampToValueAtTime(0.5, t + 3.5);
+    out.connect(this.master);
+    const nodes = [out];
+
+    // Mains hum and its harmonics: the sound of a room full of tubes.
+    for (const [freq, gain, type] of [[60, 0.055, 'sine'], [120, 0.038, 'sine'], [180, 0.016, 'triangle'], [240, 0.008, 'sine']]) {
+      const o = ctx.createOscillator();
+      o.type = type;
+      o.frequency.value = freq;
+      // A slow drift so it never sits perfectly still.
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = 0.07 + Math.random() * 0.06;
+      const lfoGain = ctx.createGain();
+      lfoGain.gain.value = gain * 0.35;
+      lfo.connect(lfoGain);
+      const g = ctx.createGain();
+      g.gain.value = gain;
+      lfoGain.connect(g.gain);
+      o.connect(g).connect(out);
+      o.start(t); lfo.start(t);
+      nodes.push(o, lfo);
+    }
+
+    // Air handling, three rooms away.
+    const air = this.noiseSource(1, 0.05);
+    air.loop = true;
+    air.stop(t + 3600);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 190; lp.Q.value = 0.6;
+    const ag = ctx.createGain();
+    ag.gain.value = 0.13;
+    air.connect(lp).connect(ag).connect(out);
+    nodes.push(air);
+
+    this.loops.set('backrooms', { nodes, out });
+    this.backroomsNext = 14 + Math.random() * 26;
+  }
+
+  // Called once a frame while a player is through the door. Long gaps, then one
+  // small thing far away, then nothing again.
+  updateBackrooms(dt) {
+    if (!this.ready || !this.loops.has('backrooms')) return;
+    this.backroomsNext -= dt;
+    if (this.backroomsNext > 0) return;
+    this.backroomsNext = 20 + Math.random() * 45;
+    const pick = Math.random();
+    if (pick < 0.34) this.tubeTick();
+    else if (pick < 0.62) this.distantThud();
+    else if (pick < 0.85) this.ventShift();
+    // The rest of the time: nothing at all.
+  }
+
+  // A failing ballast ticking somewhere out of sight.
+  tubeTick() {
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime;
+    const count = 3 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < count; i++) {
+      const at = t0 + i * (0.08 + Math.random() * 0.12);
+      const n = this.noiseSource(0.05, 2.4);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 4200 + Math.random() * 2000; bp.Q.value = 8;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.12, at);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + 0.04);
+      n.connect(bp).connect(g);
+      this.route(g, 1, undefined, undefined, { wet: 0.55 });
+    }
+  }
+
+  // Something heavy, a very long way off, in a direction you cannot place.
+  distantThud() {
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(58, t);
+    o.frequency.exponentialRampToValueAtTime(31, t + 0.7);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.16, t + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.3);
+    o.connect(g);
+    this.route(g, 1, undefined, undefined, { wet: 0.95 });
+    o.start(t); o.stop(t + 1.4);
+  }
+
+  // The air handler changing note, then settling.
+  ventShift() {
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const n = this.noiseSource(4.5, 0.09);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(150, t);
+    bp.frequency.linearRampToValueAtTime(320, t + 1.8);
+    bp.frequency.linearRampToValueAtTime(140, t + 4.4);
+    bp.Q.value = 1.2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.11, t + 1.2);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 4.4);
+    n.connect(bp).connect(g);
+    this.route(g, 1, undefined, undefined, { wet: 0.8 });
+  }
+
+  // Climbing the ladder: hands and boots on steel rungs, one at a time.
+  ladderRung(x, z) {
+    if (!this.ready) return;
+    const t = this.ctx.currentTime;
+    const n = this.noiseSource(0.2, 1.1);
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1100 + Math.random() * 900;
+    bp.Q.value = 3.2;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.24, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    n.connect(bp).connect(g);
+    this.route(g, 1, x, z, { wet: 0.5, ref: 4 });
+  }
+
+  // The way out. Deliberately not the same music as the fire: this one resolves.
+  startFinalMusic() {
+    if (!this.ready || this.loops.has('final')) return;
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime + 0.3;
+
+    const out = ctx.createGain();
+    out.gain.value = 0.0001;
+    out.gain.exponentialRampToValueAtTime(0.55, t0 + 4);
+    out.connect(this.master);
+    const send = ctx.createGain();
+    send.gain.value = 0.6;
+    out.connect(send).connect(this.convolver);
+    const nodes = [out];
+
+    // A D pedal underneath the whole thing.
+    for (const f of [73.42, 73.6]) {
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = f;
+      const g = ctx.createGain();
+      g.gain.value = 0.14;
+      o.connect(g).connect(out);
+      o.start(t0);
+      nodes.push(o);
+    }
+
+    // Warm pad that opens up rather than closing in.
+    const pad = ctx.createBiquadFilter();
+    pad.type = 'lowpass';
+    pad.frequency.setValueAtTime(300, t0);
+    pad.frequency.linearRampToValueAtTime(2200, t0 + 20);
+    pad.connect(out);
+    for (const f of [146.83, 220.00, 293.66]) {      // D3 A3 D4
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = f;
+      o.detune.value = (Math.random() - 0.5) * 6;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.045, t0 + 7);
+      o.connect(g).connect(pad);
+      o.start(t0);
+      nodes.push(o);
+    }
+
+    // A figure that climbs, where the fire ending's fell.
+    const melody = [
+      [293.66, 1], [349.23, 4], [440.00, 7], [493.88, 10],
+      [587.33, 14], [493.88, 18], [440.00, 21.5], [587.33, 25],
+      [659.25, 30], [587.33, 34], [440.00, 38],
+    ];
+    for (const [freq, at] of melody) {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = freq;
+      const g = ctx.createGain();
+      const start = t0 + at;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(0.11, start + 0.9);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 3.8);
+      o.connect(g).connect(out);
+      o.start(start); o.stop(start + 4);
+      nodes.push(o);
+    }
+
+    this.loops.set('final', { nodes, out });
   }
 
   stopLoop(name) {

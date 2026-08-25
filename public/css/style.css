@@ -412,3 +412,70 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--ink-dim);
   .meter { width: 128px; }
   #chatInputWrap { min-width: 0; width: 86vw; }
 }
+
+
+/* A full-screen fade, used for the one transition the game has: through the
+   door and out of the facility. Opacity only, so it never triggers a layout. */
+#fade {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+  /* Above the HUD, below the screens: an ending card still lands on top of it. */
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: opacity 1.1s ease;
+}
+#fade.on { opacity: 1; }
+#fadeNote {
+  font: 600 22px/1.4 var(--mono, monospace);
+  letter-spacing: 0.36em;
+  color: #cdd6de;
+  text-align: center;
+}
+#fadeSub {
+  font: 400 12px/1.4 var(--mono, monospace);
+  letter-spacing: 0.2em;
+  color: #6f7a84;
+}
+
+/* Ammunition, in the same corner as the flashlight it competes with. */
+#ammo {
+  margin-top: 8px;
+  font: 600 13px/1.3 var(--mono, monospace);
+  letter-spacing: 0.08em;
+  color: #d8c9a8;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+#ammo .ammo-name { color: #7f8a94; font-size: 11px; letter-spacing: 0.14em; }
+#ammo b { font-size: 19px; color: #f0e2bd; }
+#ammo .ammo-sep { color: #5d6670; }
+#ammo #ammoReserve { color: #97a2ac; }
+#ammo #ammoState { color: #d4863c; font-size: 11px; letter-spacing: 0.12em; }
+#ammo.empty b { color: #ff5f4a; }
+
+
+/* The closing card. Only shown for the ending that finishes the game. */
+.end-credits {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font: 400 11px/1.9 var(--mono, monospace);
+  letter-spacing: 0.16em;
+  color: #6f7a84;
+  text-align: center;
+}
+.end-credits b {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  letter-spacing: 0.34em;
+  color: #b9c4cd;
+}

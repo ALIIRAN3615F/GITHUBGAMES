@@ -37,6 +37,7 @@ export class World {
     this.map = null;
     this.grid = null;
     this.powered = 0;
+    this.doorOpen = false;
     this.flickerPhase = 0;
   }
 
@@ -114,12 +115,14 @@ export class World {
     const visible = [];
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        if (this.grid[y * w + x] === 1) continue;
+        // Anything above 0 is open space of some kind: floor, the door cell, or
+        // the passage behind it. Only rock is built as a wall.
+        if (this.grid[y * w + x] !== 0) continue;
         let exposed = false;
         for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
           const nx = x + dx, ny = y + dy;
           if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-          if (this.grid[ny * w + nx] === 1) { exposed = true; break; }
+          if (this.grid[ny * w + nx] !== 0) { exposed = true; break; }
         }
         if (exposed) visible.push([x, y]);
       }
@@ -335,96 +338,268 @@ export class World {
     this.generatorGroup = group;
   }
 
-  // The emergency exit. Deliberately not a door that happens to be open: it is
-  // a powered blast door with hazard striping, a lit sign and two lock bolts
-  // that read red or green from across the room, so its state is legible at a
-  // glance and at a distance.
+  // The emergency door.
+  //
+  // It fills a doorway cell the generator bored through a real wall, so the
+  // jambs on either side are the wall itself. The leaf is a roller shutter: it
+  // spends the round shut, and when somebody presses the button on the panel
+  // beside it, it winds up into the housing over six seconds and stays there.
   buildExit() {
-    const e = this.map.exit;
+    const d = this.map.door;
     const group = new THREE.Group();
-    group.position.set(e.x, 0, e.z);
+    group.position.set(d.x, 0, d.z);
+    // Local +Z is the direction the passage runs, so everything below is
+    // written as though the door faced you.
+    group.rotation.y = Math.atan2(d.nx, d.nz);
 
-    // Heavy frame: jambs and a lintel, merged into one draw.
+    const { cell, wallH } = this.map;
+    const halfCell = cell / 2;
+    const aperture = d.half;                 // 1.6: the opening is narrower than the cell
+    const height = d.height;                 // 3.0 under a 3.4 ceiling
+    const jamb = halfCell - aperture;        // 0.4 of wall either side
+
+    // Frame: the two jambs and the header, filling the cell around the opening
+    // so there is no gap between the door and the rock it is set into.
     const frame = mergeGeometries([
-      transformed(new THREE.BoxGeometry(0.42, 3.4, 0.62), -1.62, 1.7, 0),
-      transformed(new THREE.BoxGeometry(0.42, 3.4, 0.62), 1.62, 1.7, 0),
-      transformed(new THREE.BoxGeometry(3.66, 0.42, 0.62), 0, 3.2, 0),
-      transformed(new THREE.BoxGeometry(3.66, 0.16, 0.7), 0, 0.08, 0),   // sill
+      transformed(new THREE.BoxGeometry(jamb, wallH, cell * 0.92), -(aperture + jamb / 2), wallH / 2, 0),
+      transformed(new THREE.BoxGeometry(jamb, wallH, cell * 0.92), (aperture + jamb / 2), wallH / 2, 0),
+      transformed(new THREE.BoxGeometry(cell, wallH - height, cell * 0.92), 0, height + (wallH - height) / 2, 0),
+      transformed(new THREE.BoxGeometry(cell, 0.12, cell * 0.92), 0, 0.06, 0),          // sill
     ]);
     group.add(new THREE.Mesh(frame, this.materials.metal));
     this.disposables.push(frame);
 
-    // Hazard striping down both jambs.
+    // Guide channels the curtain runs in, and the drum housing it winds into.
+    const rails = mergeGeometries([
+      transformed(new THREE.BoxGeometry(0.2, height, 0.3), -aperture + 0.1, height / 2, -0.34),
+      transformed(new THREE.BoxGeometry(0.2, height, 0.3), aperture - 0.1, height / 2, -0.34),
+      transformed(new THREE.BoxGeometry(aperture * 2 + 0.5, 0.46, 0.5), 0, height + 0.2, -0.36),
+      transformed(new THREE.CylinderGeometry(0.09, 0.09, aperture * 2 + 0.3, 8), 0, height + 0.2, -0.62),
+    ]);
+    rails.rotateZ(0);
+    group.add(new THREE.Mesh(rails, this.materials.dark));
+    this.disposables.push(rails);
+
+    // Hazard striping down the jambs, so the doorway reads from across the room.
     const stripeTex = TEX.hazardStripes();
     stripeTex.wrapS = stripeTex.wrapT = THREE.RepeatWrapping;
     stripeTex.repeat.set(1, 4);
-    const stripeMat = new THREE.MeshStandardMaterial({ map: stripeTex, roughness: 0.8 });
-    const stripeGeo = new THREE.BoxGeometry(0.16, 3.0, 0.06);
+    const stripeMat = new THREE.MeshStandardMaterial({ map: stripeTex, roughness: 0.85 });
+    const stripeGeo = new THREE.BoxGeometry(0.14, height - 0.2, 0.06);
     for (const side of [-1, 1]) {
-      const s = new THREE.Mesh(stripeGeo, stripeMat);
-      s.position.set(side * 1.62, 1.6, 0.34);
-      group.add(s);
+      const strip = new THREE.Mesh(stripeGeo, stripeMat);
+      strip.position.set(side * (aperture + jamb / 2), height / 2, -halfCell * 0.46 - 0.03);
+      group.add(strip);
     }
     this.disposables.push(stripeTex, stripeGeo);
 
-    // The door leaf itself.
-    const door = new THREE.Mesh(new THREE.BoxGeometry(3.0, 3.05, 0.26), this.materials.rust);
-    door.position.y = 1.55;
-    door.castShadow = this.quality.shadows;
-    group.add(door);
-    this.exitDoor = door;
+    // The curtain. One box, scaled in Y as it winds up; the texture repeat is
+    // rescaled with it so the slats keep their height instead of stretching.
+    const slatTex = TEX.shutterSlats();
+    slatTex.wrapS = slatTex.wrapT = THREE.RepeatWrapping;
+    this.shutterTex = slatTex;
+    this.shutterRepeat = height / 0.34;      // one slat every 34cm
+    slatTex.repeat.set(aperture * 2 / 0.34, this.shutterRepeat);
 
-    // Reinforcing ribs, so it reads as heavy rather than as a slab.
-    const ribGeo = new THREE.BoxGeometry(2.8, 0.14, 0.32);
-    for (const y of [-1.0, 0, 1.0]) {
-      const rib = new THREE.Mesh(ribGeo, this.materials.metal);
-      rib.position.set(0, y, 0.02);
-      door.add(rib);
-    }
-    this.disposables.push(ribGeo);
+    const curtain = new THREE.Mesh(
+      new THREE.BoxGeometry(aperture * 2 - 0.06, height, 0.16),
+      new THREE.MeshStandardMaterial({ map: slatTex, roughness: 0.62, metalness: 0.55 })
+    );
+    curtain.position.set(0, height / 2, -0.34);
+    curtain.castShadow = this.quality.shadows;
+    group.add(curtain);
+    this.shutter = curtain;
+    this.shutterHeight = height;
+    this.disposables.push(slatTex, curtain.geometry, curtain.material);
 
-    // Lit EMERGENCY EXIT sign over the lintel.
+    // The weighted bottom rail, which rides the lower edge of the curtain.
+    const railTex = TEX.hazardStripes();
+    railTex.wrapS = THREE.RepeatWrapping;
+    railTex.repeat.set(6, 1);
+    const bottomRail = new THREE.Mesh(
+      new THREE.BoxGeometry(aperture * 2 - 0.02, 0.22, 0.22),
+      new THREE.MeshStandardMaterial({ map: railTex, roughness: 0.8 })
+    );
+    bottomRail.position.set(0, 0.11, -0.34);
+    group.add(bottomRail);
+    this.shutterRail = bottomRail;
+    this.disposables.push(railTex, bottomRail.geometry, bottomRail.material);
+
+    // Lit EXIT sign on the header.
     const signTex = TEX.exitSign();
     const sign = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.5, 0.5),
-      new THREE.MeshBasicMaterial({ map: signTex, transparent: false })
+      new THREE.PlaneGeometry(1.4, 0.46),
+      new THREE.MeshBasicMaterial({ map: signTex })
     );
-    sign.position.set(0, 3.2, 0.34);
+    sign.position.set(0, height + 0.2, -halfCell * 0.46 - 0.02);
+    sign.rotation.y = Math.PI;
     group.add(sign);
     this.exitSign = sign;
     this.disposables.push(signTex, sign.geometry);
 
-    // Two lock bolts. Red while the door is dead, green once it has power.
-    this.exitLocks = [];
-    const lockGeo = new THREE.BoxGeometry(0.3, 0.16, 0.14);
-    for (const side of [-1, 1]) {
-      const lock = new THREE.Mesh(lockGeo, new THREE.MeshBasicMaterial({ color: 0xff2a1a }));
-      lock.position.set(side * 1.35, 1.55, 0.3);
-      group.add(lock);
-      this.exitLocks.push(lock);
-    }
-    this.disposables.push(lockGeo);
-
-    // Conduit feeding the lock mechanism, so the power connection is visible.
-    const conduit = mergeGeometries([
-      transformed(new THREE.CylinderGeometry(0.06, 0.06, 2.6, 6), -1.9, 1.5, 0.2),
-      transformed(new THREE.CylinderGeometry(0.05, 0.05, 1.1, 6), 1.9, 2.2, 0.2),
-      transformed(new THREE.BoxGeometry(0.26, 0.34, 0.2), 1.9, 1.5, 0.2),   // junction box
-    ]);
-    group.add(new THREE.Mesh(conduit, this.materials.dark));
-    this.disposables.push(conduit);
-
-    this.exitLight = new THREE.PointLight(0xff2a1a, 10, 13, 1.9);
-    this.exitLight.position.set(0, 2.6, 0.8);
-    group.add(this.exitLight);
-
-    const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshBasicMaterial({ color: 0xff2a1a }));
-    lamp.position.set(0, 3.62, 0.2);
-    group.add(lamp);
-    this.exitLamp = lamp;
-
     this.root.add(group);
     this.exitGroup = group;
+
+    this.buildDoorPanel(d);
+    this.buildBreach(d);
+  }
+
+  // The control panel. A physical box on the wall beside the door with a
+  // labelled plate that reads POWER: OFF until the generator is running, and a
+  // button that does nothing at all until it does.
+  buildDoorPanel(d) {
+    const p = d.panel;
+    const group = new THREE.Group();
+    group.position.set(p.x, p.y, p.z);
+    group.rotation.y = p.yaw;
+
+    const body = mergeGeometries([
+      transformed(new THREE.BoxGeometry(0.62, 0.78, 0.16), 0, 0, 0),
+      transformed(new THREE.BoxGeometry(0.68, 0.06, 0.2), 0, 0.42, 0.01),      // hood
+      transformed(new THREE.CylinderGeometry(0.05, 0.05, 0.9, 6), -0.36, -0.4, 0),  // conduit
+    ]);
+    group.add(new THREE.Mesh(body, this.materials.metal));
+    this.disposables.push(body);
+
+    // The label plate: two pre-painted textures, swapped rather than repainted.
+    this.panelLabels = { off: TEX.panelLabel(false), on: TEX.panelLabel(true) };
+    const plate = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.46, 0.3),
+      new THREE.MeshBasicMaterial({ map: this.panelLabels.off })
+    );
+    plate.position.set(0, 0.16, 0.085);
+    group.add(plate);
+    this.panelPlate = plate;
+    this.disposables.push(this.panelLabels.off, this.panelLabels.on, plate.geometry, plate.material);
+
+    // The button itself: a big industrial mushroom head on a collar.
+    const collar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.11, 0.11, 0.05, 12),
+      this.materials.dark
+    );
+    collar.rotation.x = Math.PI / 2;
+    collar.position.set(0, -0.14, 0.09);
+    group.add(collar);
+    this.disposables.push(collar.geometry);
+
+    const head = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.085, 0.095, 0.07, 12),
+      new THREE.MeshStandardMaterial({ color: 0x8f1d14, roughness: 0.5, emissive: 0x220604 })
+    );
+    head.rotation.x = Math.PI / 2;
+    head.position.set(0, -0.14, 0.13);
+    group.add(head);
+    this.panelButton = head;
+    this.disposables.push(head.geometry, head.material);
+
+    // Two indicator lamps under the hood.
+    this.panelLamps = [];
+    const lampGeo = new THREE.SphereGeometry(0.032, 8, 6);
+    for (const x of [-0.2, 0.2]) {
+      const lamp = new THREE.Mesh(lampGeo, new THREE.MeshBasicMaterial({ color: 0x3a1512 }));
+      lamp.position.set(x, 0.35, 0.09);
+      group.add(lamp);
+      this.panelLamps.push(lamp);
+    }
+    this.disposables.push(lampGeo);
+
+    // The one light the door gets. It reads red across the room while the panel
+    // is dead and green once it has power, which is the whole state machine at
+    // a glance.
+    this.exitLight = new THREE.PointLight(0xff2a1a, 6, 9, 2.1);
+    this.exitLight.position.set(0, 0.3, 0.5);
+    group.add(this.exitLight);
+
+    this.root.add(group);
+    this.panelGroup = group;
+  }
+
+  // Where the passage behind the door gives out. Not a door, not a stairwell:
+  // the wall has come away, and what is behind it is lit.
+  buildBreach(d) {
+    const t = d.threshold;
+    const group = new THREE.Group();
+    // Sit it on the face of the rock at the end of the passage.
+    group.position.set(t.x + d.nx * (this.map.cell / 2 - 0.06), 0, t.z + d.nz * (this.map.cell / 2 - 0.06));
+    group.rotation.y = Math.atan2(d.nx, d.nz);
+
+    const glow = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.5, 2.4),
+      new THREE.MeshBasicMaterial({ color: 0xd8c078 })
+    );
+    glow.position.set(0, 1.2, -0.02);
+    glow.rotation.y = Math.PI;
+    group.add(glow);
+    this.breachGlow = glow;
+    this.disposables.push(glow.geometry, glow.material);
+
+    // Torn plasterboard around the hole.
+    const torn = mergeGeometries([
+      transformed(new THREE.BoxGeometry(0.5, 2.6, 0.12), -1.42, 1.3, -0.08),
+      transformed(new THREE.BoxGeometry(0.5, 2.6, 0.12), 1.42, 1.3, -0.08),
+      transformed(new THREE.BoxGeometry(3.4, 0.55, 0.12), 0, 2.65, -0.08),
+      transformed(new THREE.BoxGeometry(0.34, 0.7, 0.12), -0.9, 2.2, -0.14),
+      transformed(new THREE.BoxGeometry(0.26, 0.5, 0.12), 0.7, 2.35, -0.14),
+    ]);
+    group.add(new THREE.Mesh(torn, this.materials.dark));
+    this.disposables.push(torn);
+
+    this.breachLight = new THREE.PointLight(0xffe6a0, 0, 12, 1.8);
+    this.breachLight.position.set(0, 1.5, -1.6);
+    group.add(this.breachLight);
+
+    group.visible = false;         // nothing to see until the door is up
+    this.root.add(group);
+    this.breachGroup = group;
+  }
+
+  // Driven straight from the server's door phase and progress, so every client
+  // sees the same shutter at the same height.
+  updateDoor(dt, phase, progress, generatorOn) {
+    if (!this.shutter) return;
+
+    const height = this.shutterHeight;
+    const lift = Math.max(0, Math.min(1, progress));
+    // A roller shutter's bottom edge rises: the curtain shrinks from below.
+    const visible = Math.max(0.001, 1 - lift);
+    this.shutter.scale.y = visible;
+    this.shutter.position.y = height * (1 + lift) / 2;
+    // Keep the slats the same height however far the curtain has wound up.
+    this.shutterTex.repeat.y = this.shutterRepeat * visible;
+
+    const opening = phase === 1;
+    // Steel rattling in the guides.
+    const rattle = opening ? Math.sin(this.flickerPhase * 47) * 0.012 : 0;
+    this.shutter.position.x = rattle;
+    this.shutterRail.position.x = rattle;
+    this.shutterRail.position.y = height * lift + 0.11;
+    this.shutterRail.visible = lift < 0.995;
+
+    // The panel: dead red until the generator is running, green once it is.
+    if (this.panelPlate) {
+      const wanted = generatorOn ? this.panelLabels.on : this.panelLabels.off;
+      if (this.panelPlate.material.map !== wanted) {
+        this.panelPlate.material.map = wanted;
+        this.panelPlate.material.needsUpdate = true;
+      }
+      const c = generatorOn ? 0x3dff77 : 0xff2a1a;
+      this.exitLight.color.setHex(c);
+      this.exitLight.intensity = generatorOn ? 6 + Math.sin(this.flickerPhase * 3) * 1.4 : 3.5;
+      for (const lamp of this.panelLamps) lamp.material.color.setHex(generatorOn ? 0x3dff77 : 0x3a1512);
+      this.panelButton.material.emissive.setHex(generatorOn ? 0x5a1008 : 0x160302);
+      if (this.exitSign) this.exitSign.material.color.setScalar(generatorOn ? 1 : 0.24);
+    }
+
+    // Once the way is open, what is behind it starts to show.
+    if (this.breachGroup) {
+      const show = lift > 0.25;
+      this.breachGroup.visible = show;
+      if (show) {
+        const buzz = 0.88 + Math.sin(this.flickerPhase * 21) * 0.06 + (Math.random() < 0.006 ? -0.45 : 0);
+        this.breachLight.intensity = 13 * lift * buzz;
+        this.breachGlow.material.color.setRGB(0.85 * buzz, 0.76 * buzz, 0.47 * buzz);
+      }
+    }
   }
 
   // --- Fire (ending 2) ------------------------------------------------------
@@ -513,7 +688,7 @@ export class World {
 
   // --- Per-frame -----------------------------------------------------------
 
-  update(dt, playerPos, powered, exitOpen, generatorOn, fire = 0, camera = null) {
+  update(dt, playerPos, powered, door, generatorOn, fire = 0, camera = null) {
     this.flickerPhase += dt;
     const need = this.map ? this.map.fuseCount : 1;
     const ratio = need ? powered / need : 0;
@@ -530,22 +705,9 @@ export class World {
       this.fuseSlots[i].material.color.setHex(i < powered ? 0xffc24a : 0x2b1d16);
     }
 
-    // Exit: the door lifts and the lamp turns when the power lands.
-    // The emergency door is an electrical lock: with no power it is shut and
-    // its bolts read red; with power the bolts throw green and it lifts.
-    if (this.exitDoor) {
-      const unlocked = !!exitOpen;
-      const target = unlocked ? 4.5 : 1.55;
-      this.exitDoor.position.y += (target - this.exitDoor.position.y) * Math.min(1, dt * 0.8);
-
-      const c = unlocked ? 0x3dff77 : 0xff2a1a;
-      this.exitLight.color.setHex(c);
-      this.exitLamp.material.color.setHex(c);
-      this.exitLight.intensity = unlocked ? 22 + Math.sin(this.flickerPhase * 3) * 6 : 7;
-      for (const lock of this.exitLocks || []) lock.material.color.setHex(c);
-      // The sign only lights when the emergency circuit is live.
-      if (this.exitSign) this.exitSign.material.color.setScalar(unlocked ? 1 : 0.22);
-    }
+    // doorOpen is set the moment a snapshot lands, not here, so collision never
+    // trails the server by a frame.
+    this.updateDoor(dt, door ? door[0] : 0, door ? door[1] : 0, generatorOn);
 
     this.updateLamps(dt, playerPos, ratio, generatorOn);
     this.updateFire(dt, fire, camera);
@@ -625,7 +787,13 @@ export class World {
   isSolidCell(cx, cy) {
     const { w, h } = this.map;
     if (cx < 0 || cy < 0 || cx >= w || cy >= h) return true;
-    return this.grid[cy * w + cx] !== 1;
+    const v = this.grid[cy * w + cx];
+    if (v === 0) return true;
+    // The doorway is a wall until the shutter is all the way up. The server
+    // agrees, cell for cell, so nobody can walk through a door that is only
+    // open on their own machine.
+    if (v === 2) return !this.doorOpen;
+    return false;
   }
 
   isSolidAt(x, z) {
@@ -645,9 +813,36 @@ export class World {
       const prevX = outX, prevZ = outZ;
       ({ x: outX, z: outZ } = this.pushOutOfWalls(outX, outZ, radius));
       ({ x: outX, z: outZ } = this.pushOutOfProps(outX, outZ, radius));
+      ({ x: outX, z: outZ } = this.clampToAperture(outX, outZ, radius));
       if (Math.abs(outX - prevX) < 1e-6 && Math.abs(outZ - prevZ) < 1e-6) break;
     }
     return { x: outX, z: outZ };
+  }
+
+  // The opening in the door cell is narrower than the cell itself, so without
+  // this a body could drift past a jamb and end up standing inside the wall the
+  // door is set into. The same clamp runs on the server.
+  clampToAperture(x, z, radius) {
+    const d = this.map && this.map.door;
+    if (!d) return { x, z };
+    const c = this.worldToCell(x, z);
+    const inDoor = c.cx === d.cx && c.cy === d.cy;
+
+    // While the shutter is down, nothing belongs in the doorway or the passage
+    // behind it. Deep inside a solid cell the nearest face is the far one, so
+    // the generic push-out would post a body straight through; whatever put
+    // them there, they come back out the way they went in.
+    if (!this.doorOpen) {
+      const inPassage = (d.vestibule || []).some((v) => v.cx === c.cx && v.cy === c.cy);
+      if (!inDoor && !inPassage) return { x, z };
+      const back = this.map.cell / 2 + radius + 0.02;
+      return { x: d.x - d.nx * back, z: d.z - d.nz * back };
+    }
+
+    if (!inDoor) return { x, z };
+    const limit = Math.max(0.05, d.half - radius);
+    if (d.nx !== 0) return { x, z: Math.max(d.z - limit, Math.min(d.z + limit, z)) };
+    return { x: Math.max(d.x - limit, Math.min(d.x + limit, x)), z };
   }
 
   // Circle against the axis-aligned boxes of the solid cells around it.
@@ -717,6 +912,11 @@ export class World {
     this.lamps = [];
     this.lampLights = [];
     this.fuseSlots = [];
+    this.shutter = null;
+    this.shutterRail = null;
+    this.panelPlate = null;
+    this.breachGroup = null;
+    this.doorOpen = false;
     this.obstacles = [];
     this.obstacleBuckets = new Map();
     this.root = new THREE.Group();

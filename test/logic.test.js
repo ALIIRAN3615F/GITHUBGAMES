@@ -25,10 +25,16 @@ test('every generated map keeps its objectives reachable', () => {
 
     assert.strictEqual(grid[idx(from.cx, from.cy, map.w)], 1, `seed ${seed}: spawn is inside rock`);
 
-    for (const [name, target] of [['generator', map.generator], ['exit', map.exit]]) {
-      const path = findPath(grid, map.w, map.h, from, { cx: target.cx, cy: target.cy });
-      assert.ok(path, `seed ${seed}: ${name} unreachable from spawn`);
-    }
+    const path = findPath(grid, map.w, map.h, from, { cx: map.generator.cx, cy: map.generator.cy });
+    assert.ok(path, `seed ${seed}: generator unreachable from spawn`);
+
+    // The door itself is not walkable - that is the point of it - so what has
+    // to be reachable is the floor in front of it and its control panel.
+    const approach = worldToCell(map.door.approach.x, map.door.approach.z, map.w, map.h);
+    assert.strictEqual(grid[idx(approach.cx, approach.cy, map.w)], 1,
+      `seed ${seed}: the floor in front of the door is not floor`);
+    assert.ok(findPath(grid, map.w, map.h, from, approach),
+      `seed ${seed}: cannot walk to the emergency door`);
     for (const fuse of map.fuses) {
       const cell = worldToCell(fuse.x, fuse.z, map.w, map.h);
       assert.strictEqual(grid[idx(cell.cx, cell.cy, map.w)], 1, `seed ${seed}: fuse ${fuse.id} inside rock`);
@@ -219,6 +225,10 @@ function standAt(player, point) {
   player.z = point.z;
 }
 
+const run = (session, seconds) => {
+  for (let i = 0; i < Math.round(seconds * 30); i++) session.update(1 / 30);
+};
+
 test('names are sanitised and never empty', () => {
   const session = new Session();
   const a = session.addPlayer(fakeConn(), '   ');
@@ -248,9 +258,9 @@ test('only the host can change settings or start the round', () => {
   assert.strictEqual(session.phase, 'lobby', 'a guest started the round');
 });
 
-test('a full round: collect every fuse, power the generator, escape', () => {
+test('a full round: every fuse, the generator, the door, and out through the vent', () => {
   const { session, players } = startedSession(2, { fuses: 3 });
-  const [alice] = players;
+  const [alice, bob] = players;
   assert.strictEqual(session.phase, 'playing');
   assert.strictEqual(session.fuses.length, 3);
 
@@ -265,18 +275,39 @@ test('a full round: collect every fuse, power the generator, escape', () => {
   }
 
   assert.strictEqual(session.powered, 3);
-  assert.ok(session.exitOpen, 'exit did not open once every fuse was seated');
+  assert.strictEqual(session.generatorOn, true, 'the last fuse did not start the generator');
   assert.strictEqual(alice.stats.fuses, 3);
+  // Power alone does not open the door. Somebody has to press the button.
+  assert.strictEqual(session.door.phase, 0, 'the generator opened the door by itself');
 
-  standAt(alice, session.map.exit);
-  session.handle(alice, { t: 'use', k: 'exit' });
-  assert.strictEqual(alice.state, 3, 'escape did not register');
+  standAt(alice, session.map.door.panel);
+  session.handle(alice, { t: 'use', k: 'button' });
+  assert.strictEqual(session.door.phase, 1, 'the button did not start the shutter');
+  run(session, 7);
+  assert.strictEqual(session.door.phase, 2, 'the shutter never finished');
+  // ...and opening it is not an ending.
+  assert.strictEqual(session.phase, 'playing', 'the door ended the round');
+
+  // Through the passage and into the Backrooms. Still not an ending.
+  standAt(alice, session.map.door.threshold);
+  session.update(1 / 30);
+  assert.strictEqual(alice.zone, 1, 'crossing the threshold did not go through');
+  assert.strictEqual(session.phase, 'playing', 'the transition ended the round');
+  assert.strictEqual(alice.state, 0, 'the transition marked a player as out');
+
+  // The ladder at the end of the corridor is the only way out.
+  standAt(alice, session.back.ladder);
+  session.handle(alice, { t: 'use', k: 'ladder' });
+  assert.ok(alice.climb > 0, 'the climb never started');
+  run(session, 5.2);
+  assert.strictEqual(alice.state, 3, 'reaching the vent did not register');
   // The round continues while the second player is still down there.
   assert.strictEqual(session.phase, 'playing');
 
-  const [, bob] = players;
-  standAt(bob, session.map.exit);
-  session.handle(bob, { t: 'use', k: 'exit' });
+  bob.zone = 1;
+  standAt(bob, session.back.ladder);
+  session.handle(bob, { t: 'use', k: 'ladder' });
+  run(session, 5.2);
   assert.strictEqual(session.phase, 'ended');
   assert.strictEqual(session.outcome, 'escaped');
 });
@@ -457,9 +488,12 @@ test('snapshots carry every player, monster, fuse and battery', () => {
   assert.strictEqual(snap.m.length, session.monsters.length);
   assert.strictEqual(snap.f.length, session.fuses.length);
   assert.strictEqual(snap.b.length, session.batteries.length);
-  // [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
-  assert.strictEqual(snap.p[0].length, 12, 'player row layout changed');
+  // [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge,
+  //  reserve, zone, climb]
+  assert.strictEqual(snap.p[0].length, 14, 'player row layout changed');
   assert.strictEqual(typeof snap.o, 'number', 'generator state not broadcast');
+  assert.ok(Array.isArray(snap.dr), 'the door is not in the snapshot');
+  assert.ok(Array.isArray(snap.wp), 'the rifle is not in the snapshot');
 });
 
 test('an empty session falls back to the lobby', () => {
@@ -591,13 +625,12 @@ test('the generator switch is authoritative and only live once fully fused', () 
     session.handle(a, { t: 'use', k: 'insert' });
   }
   assert.strictEqual(session.generatorOn, true, 'the last fuse did not start the generator');
-  assert.strictEqual(session.exitOpen, true);
+  // Power lights the door's panel. It does not open the door.
+  assert.strictEqual(session.door.phase, 0, 'power opened the door on its own');
 
   // Now it is a switch, and either player can throw it.
   session.handle(a, { t: 'use', k: 'power' });
   assert.strictEqual(session.generatorOn, false, 'could not switch the power off');
-  // The emergency door runs off the same supply: no power, no exit.
-  assert.strictEqual(session.exitOpen, false, 'the exit stayed powered with the generator off');
 
   b.x = gen.x; b.z = gen.z;
   session.handle(b, { t: 'use', k: 'power' });

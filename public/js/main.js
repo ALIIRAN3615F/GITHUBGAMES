@@ -9,6 +9,8 @@ import { Hud } from './hud.js';
 import { Fx } from './fx.js';
 import { AudioEngine } from './audio.js';
 import { World, QUALITY } from './world.js';
+import { Backrooms } from './backrooms.js';
+import { ViewWeapon } from './weapon.js';
 import { Entities, MONSTER_STATE, PLAYER_STATE, FLAG } from './entities.js';
 import { Input, LocalPlayer } from './player.js';
 
@@ -26,16 +28,33 @@ const AMBIENT_LIT = 9;
 // here the picture is mush and the game stops being readable in the dark.
 const MIN_RENDER_SCALE = 0.55;
 
+// The Backrooms are the opposite of the facility: flatly, evenly lit, with
+// nowhere for anything to hide. That is the horror of them. Bright enough to
+// see every corner, dim enough that the walls stay a dirty mustard rather than
+// blowing out to white.
+const AMBIENT_BACKROOMS = 5.5;
+
+// The rifle's rate of fire, in seconds between rounds, and how many rounds a
+// magazine holds. The server enforces both, so this is prediction, not
+// permission.
+const FIRE_INTERVAL = 0.096;
+const MAG_SIZE = 30;
+
 const HOLD_TIME = {
-  fuse: 0.9, insert: 1.9, revive: 3.6, exit: 1.4,
+  fuse: 0.9, insert: 1.9, revive: 3.6,
   battery: 0.4, power: 1.2,
   gas: 0.7,
   // Pouring is deliberately the longest thing you can do, and the loudest.
   pour: 3.2,
+  // The door button is a button: you press it, you do not wrestle with it.
+  button: 0.25,
+  weapon: 0.8,
+  ladder: 0.5,
 };
 const REACH = {
-  fuse: 2.6, insert: 3.4, revive: 2.6, exit: 4.0,
+  fuse: 2.6, insert: 3.4, revive: 2.6,
   battery: 2.4, power: 3.6, gas: 2.6, pour: 3.6,
+  button: 2.4, weapon: 2.6, ladder: 2.0,
 };
 
 class Game {
@@ -55,8 +74,18 @@ class Game {
     this.snapshot = null;
     this.powered = 0;
     this.need = 6;
-    this.exitOpen = false;
     this.roundTime = 0;
+    this.zone = 0;
+    this.door = [0, 0];
+    this.back = null;
+    this.armed = false;
+    this.ammo = { mag: 0, reserve: 0, reloading: 0 };
+    this.climb = 0;
+    this.transitioning = false;
+    this.fireHeld = false;
+    this.shotDebt = 0;
+    this.dryTimer = 0;
+    this.climbStep = 0;
     this.hold = { kind: null, id: null, time: 0, cooldown: 0 };
     this.heartTimer = 0;
     this.growlTimer = 6;
@@ -111,6 +140,12 @@ class Game {
     // Filmic tone mapping keeps the flashlight hotspot from blowing out to white.
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.1;
+    // The rifle is drawn in a second pass over a cleared depth buffer, so the
+    // frame clears itself once, explicitly, instead of once per render call.
+    this.renderer.autoClear = false;
+    // ...which also means the render counters have to be reset by hand, or the
+    // second pass wipes the first pass's numbers before anyone can read them.
+    this.renderer.info.autoReset = false;
   }
 
   setupScene() {
@@ -137,6 +172,9 @@ class Game {
     };
 
     this.world = new World(this.scene, this.settings.quality);
+    this.backrooms = new Backrooms(this.scene, this.settings.quality);
+    this.viewWeapon = new ViewWeapon(this.settings.quality);
+    this.viewWeapon.resize(window.innerWidth / window.innerHeight);
     this.entities = new Entities(this.scene, this.settings.quality);
   }
 
@@ -145,6 +183,7 @@ class Game {
     this.camera.updateProjectionMatrix();
     if (this.renderScale) this.renderer.setPixelRatio(this.renderScale);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+    if (this.viewWeapon) this.viewWeapon.resize(window.innerWidth / window.innerHeight);
   }
 
   // --- Wiring ---------------------------------------------------------------
@@ -242,6 +281,9 @@ class Game {
         case 'KeyR':
           if (this.phase === 'playing' && this.player.state === PLAYER_STATE.ALIVE) this.reload();
           break;
+        case 'KeyG':
+          if (this.phase === 'playing' && this.armed) this.net.use('dropgun');
+          break;
         case 'Tab':
           if (this.phase === 'playing') this.showScoreboard(true);
           break;
@@ -253,10 +295,29 @@ class Game {
     window.addEventListener('keyup', (e) => {
       if (e.code === 'Tab') this.showScoreboard(false);
     });
+
+    // The rifle is fired with the mouse, held down: it is an automatic.
+    this.canvas.addEventListener('mousedown', (e) => {
+      if (e.button === 0) this.fireHeld = true;
+    });
+    window.addEventListener('mouseup', (e) => {
+      if (e.button === 0) this.fireHeld = false;
+    });
+    window.addEventListener('blur', () => { this.fireHeld = false; });
   }
 
-  // Load a fresh battery: one from the reserve, flashlight back to full.
+  // R feeds whatever is empty. The rifle takes priority when it is the thing
+  // that needs it, because that is the one you are about to want.
   reload() {
+    if (this.armed && this.ammo.mag < MAG_SIZE && this.ammo.reserve > 0 && !this.ammo.reloading) {
+      this.net.send({ t: 'rl' });
+      return;
+    }
+    if (this.armed && this.ammo.mag < MAG_SIZE && this.ammo.reserve === 0 && this.player.charge >= 99.5) {
+      this.hud.banner('NO MAGAZINES LEFT', 'bad', 1.8);
+      this.audio.blip(240, 0.08, 'square', 0.09);
+      return;
+    }
     if (this.player.reserve <= 0) {
       this.hud.banner('NO SPARE BATTERIES', 'bad', 1.8);
       this.audio.blip(240, 0.08, 'square', 0.09);
@@ -284,8 +345,16 @@ class Game {
     this.net.disconnect();
     this.audio.stopAll();
     this.phase = 'title';
+    this.zone = 0;
+    this.armed = false;
+    this.climb = 0;
+    this.transitioning = false;
     this.entities.reset();
     this.world.dispose();
+    this.backrooms.dispose();
+    this.viewWeapon.equip(false);
+    this.hud.setFade(false);
+    this.hud.setAmmo(false, 0, 0, 0);
     this.hud.setHudVisible(false);
     this.hud.showScreen('title');
     this.hud.setJoinError('');
@@ -301,13 +370,23 @@ class Game {
     // disappears into geometry building.
     requestAnimationFrame(() => {
       this.map = m.map;
+      this.back = m.back || null;
       this.need = m.need;
       this.powered = 0;
-      this.exitOpen = false;
       this.roundTime = 0;
       this.spectating = null;
       this.generatorOn = false;
+      this.door = [0, 0];
+      this.zone = 0;
+      this.armed = false;
+      this.climb = 0;
+      this.transitioning = false;
+      this.ammo = { mag: 0, reserve: 0, reloading: 0 };
       this.entities.reset();
+      this.backrooms.dispose();
+      this.viewWeapon.equip(false);
+      this.hud.setFade(false);
+      this.hud.setAmmo(false, 0, 0, 0);
       this.world.build(m.map);
       this.entities.setMap(m.map);
 
@@ -364,7 +443,13 @@ class Game {
     this.input.exitLock();
     this.audio.setTension(0);
     this.audio.stopLoop('generator');
+    this.audio.stopLoop('backrooms');
+    // The fade is only ever there to cover a transition; the results card is
+    // the thing that should be on screen now.
+    this.hud.setFade(false);
     this.fx.reset();
+    // Whichever ending music is already running keeps running over the card.
+    if (this.audio.loops.has('final') || this.audio.loops.has('ending')) return;
     if (m.outcome === 'escaped') this.audio.revived();
     else this.audio.hit();
   }
@@ -375,7 +460,11 @@ class Game {
     this.snapshot = m;
     this.entities.push(m);
     this.powered = m.g;
-    this.exitOpen = !!m.x;
+    this.door = m.dr || [0, 0];
+    // Collision must follow the server's door state immediately, not on the
+    // next rendered frame: on a machine drawing at a few frames a second that
+    // is the difference between a doorway that is open and one that is not.
+    this.world.doorOpen = this.door[0] === 2;
     this.generatorOn = !!m.o;
     this.sabotage = m.sb || null;
     this.fire = m.fi || 0;
@@ -383,10 +472,27 @@ class Game {
     this.carryingGas = !!(m.gs && m.gs[2] === 1 && m.gs[3] === this.localId);
     this.roundTime = m.tm;
 
-    // Row: [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge, reserve]
+    // The rifle. It is one object in the whole round, so the snapshot carries
+    // its ammunition rather than each player carrying their own.
+    const gun = m.wp;
+    const wasArmed = this.armed;
+    this.armed = !!(gun && gun[2] === 1 && gun[3] === this.localId);
+    if (gun) this.ammo = { mag: gun[4], reserve: gun[5], reloading: gun[6] };
+    if (this.armed !== wasArmed) {
+      this.viewWeapon.equip(this.armed);
+      if (this.armed) this.hud.addSystem('Rifle. Sixty rounds, and nothing down here that reloads it.');
+    }
+
+    // Row: [id, x, y, z, yaw, pitch, flags, state, carrying, downTimer, charge,
+    //       reserve, zone, climb]
     const mine = (m.p || []).find((row) => row[0] === this.localId);
     if (mine) {
       const wasState = this.player.state;
+      const serverZone = mine[12] ?? 0;
+      this.climb = mine[13] ?? 0;
+      // The server decides when you have crossed over; the client just plays
+      // the transition it is told to play.
+      if (serverZone !== this.zone && !this.transitioning) this.crossOver(serverZone, mine);
       this.player.state = mine[7];
       this.carrying = mine[8] >= 0;
       this.downTimer = mine[9];
@@ -428,6 +534,134 @@ class Game {
     this.hud.setDead(to === PLAYER_STATE.DEAD);
   }
 
+  // Whichever level the player is actually standing in. Both classes answer
+  // the same three questions the local simulation asks of them.
+  activeWorld() {
+    return this.zone === 1 && this.backrooms.built ? this.backrooms : this.world;
+  }
+
+  // The one transition in the game. The fade covers building the Backrooms and
+  // tearing the facility down, so the swap costs nothing while anyone is
+  // looking at it - and the weaker the machine, the more that matters.
+  crossOver(zone, row) {
+    if (zone !== 1 || !this.back) return;
+    this.transitioning = true;
+    this.hud.setFade(true);
+    this.audio.stopLoop('ambient');
+    this.audio.stopLoop('generator');
+    this.audio.setTension(0);
+
+    setTimeout(() => {
+      // Leaving or ending the round mid-fade must not bring it back.
+      if (this.phase !== 'playing' || !this.back) { this.transitioning = false; return; }
+      this.zone = 1;
+      this.backrooms.build(this.back);
+      // Nothing in the facility is reachable again, so nothing in it needs to
+      // stay in memory or in the draw list.
+      this.world.dispose();
+      this.player.teleport(row[1], row[3]);
+      this.player.yaw = row[4];
+      this.player.pitch = 0;
+      this.scene.fog.density = 0.024;
+      this.scene.fog.color.setHex(0xbda86a);
+      this.scene.background = new THREE.Color(0xbda86a);
+      this.ambient.color.setHex(0xfff0c0);
+      this.fx.reset();
+
+      this.audio.startBackroomsAmbient();
+      this.hud.setObjective('Find the way out', false);
+      this.hud.setFusePips(0, 0);
+      this.hud.addSystem('The corridor smells of damp carpet. The lights do not stop.');
+      this.hud.banner('WHERE IS THIS', '', 4);
+      this.hud.setFade(false);
+      this.transitioning = false;
+    }, 1100);
+  }
+
+  // The ladder. The server owns the climb, so all the client does is put the
+  // camera where the server says it is and make it feel like climbing.
+  updateClimb(dt) {
+    const ladder = this.back && this.back.ladder;
+    if (!ladder) return;
+    this.player.look(this.input);
+    this.player.position.x = ladder.x - Math.sin(ladder.yaw) * 0.55;
+    this.player.position.z = ladder.z - Math.cos(ladder.yaw) * 0.55;
+
+    const eye = 1.62 + this.climb * (ladder.top + 0.9);
+    const sway = Math.sin(this.climb * 34) * 0.045;
+    this.camera.position.set(
+      this.player.position.x + Math.cos(ladder.yaw) * sway,
+      eye,
+      this.player.position.z - Math.sin(ladder.yaw) * sway
+    );
+    this.camera.rotation.set(this.player.pitch + sway * 0.3, this.player.yaw, sway * 0.12, 'YXZ');
+
+    // One sound per rung, keyed off how far up they are rather than a timer,
+    // so it stays in step with what is on screen.
+    const step = Math.floor(this.climb * 11);
+    if (step !== this.climbStep) {
+      this.climbStep = step;
+      this.audio.ladderRung(this.player.position.x, this.player.position.z);
+    }
+  }
+
+  // Firing. The client picks the direction and plays the flash; the server
+  // decides whether anything was hit.
+  updateShooting(dt) {
+    const holding = this.armed && this.fireHeld && this.input.locked
+      && this.player.state === PLAYER_STATE.ALIVE
+      && !this.hud.chatOpen && !this.hud.current && !this.ammo.reloading;
+
+    if (!holding) {
+      this.shotDebt = 0;
+      this.lastFireTick = performance.now();
+      this.dryTimer = Math.max(0, (this.dryTimer ?? 0) - dt);
+      return;
+    }
+
+    if (this.ammo.mag <= 0) {
+      // Dry. Deliberately slower than the trigger, so holding it down on an
+      // empty rifle is a click rather than a machine gun of clicks.
+      this.shotDebt = 0;
+      this.dryTimer = Math.max(0, (this.dryTimer ?? 0) - dt);
+      if (this.dryTimer > 0) return;
+      this.dryTimer = 0.45;
+      this.viewWeapon.dryFire();
+      this.audio.dryFire(this.player.position.x, this.player.position.z);
+      return;
+    }
+
+    // The rifle's cadence is measured in seconds, not in frames. On a machine
+    // rendering at five frames a second, one shot per frame would quietly halve
+    // its rate of fire, so what is owed accumulates and is paid out here - and
+    // it accumulates in real time, not in the frame delta, which is clamped for
+    // the sake of the physics. The cap stops a long hitch from emptying the
+    // magazine in a single frame.
+    const now = performance.now();
+    const real = Math.min(0.5, (now - (this.lastFireTick ?? now)) / 1000);
+    this.lastFireTick = now;
+    this.shotDebt = Math.min((this.shotDebt ?? 0) + real, FIRE_INTERVAL * 6);
+
+    let fired = 0;
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    while (this.shotDebt >= FIRE_INTERVAL && this.ammo.mag > 0) {
+      this.shotDebt -= FIRE_INTERVAL;
+      // Predict the round locally so the shot feels instant; the count the
+      // server sends back in the next snapshot is the one that counts.
+      this.ammo.mag--;
+      this.net.shoot(dir);
+      this.audio.gunshot(this.player.position.x, this.player.position.z, true);
+      fired++;
+    }
+    if (!fired) return;
+
+    // One flash and one kick a frame however many rounds went out in it -
+    // there is only one frame to show them in.
+    this.viewWeapon.fire();
+    this.player.kick(0.85 * Math.min(2, fired));
+    this.fx.hitFlash(0.06, 0.09, '#ffd9a0');
+  }
+
   onEvent(ev) {
     switch (ev.k) {
       case 'ambient': {
@@ -458,12 +692,102 @@ class Game {
       case 'gas-dropped':
         this.hud.addSystem('The gasoline hit the floor.');
         break;
-      case 'door':
-        if (!ev.locked) {
+      // --- The emergency door -------------------------------------------------
+      case 'door-power':
+        if (ev.on) {
           this.audio.doorUnlock(ev.x, ev.z);
-          this.hud.banner('EMERGENCY DOOR UNLOCKED', 'good', 4);
+          this.hud.banner('DOOR PANEL LIVE', 'good', 3.6);
+          this.hud.addSystem('The panel by the bulkhead reads POWER: ON. Somebody has to press it.');
         } else {
-          this.hud.addSystem('The emergency door lost power and re-locked.');
+          this.hud.addSystem('The door panel went dark.');
+        }
+        break;
+      case 'door-dead':
+        this.audio.buttonPress(ev.x, ev.z, true);
+        if (ev.id === this.localId) this.hud.banner('NO POWER TO THE DOOR', 'bad', 2.4);
+        break;
+      case 'door-open':
+        this.audio.buttonPress(ev.x, ev.z, false);
+        this.audio.doorSequence(ev.x, ev.z, ev.seconds);
+        this.hud.banner('THE SHUTTER IS COMING UP', '', 4);
+        this.hud.addSystem(`${ev.by} pressed the button. Every floor of this building just heard it.`);
+        break;
+      case 'door-opened':
+        this.hud.banner('THE WAY IS OPEN', 'good', 3.4);
+        this.hud.addSystem('There is a passage behind the bulkhead. It does not look like the rest of the building.');
+        break;
+      case 'backrooms':
+        if (ev.id !== this.localId) this.hud.addSystem(`${ev.who} went through.`);
+        break;
+      case 'climb':
+        if (ev.id === this.localId) {
+          this.climbStep = -1;
+          this.hud.banner('CLIMBING', '', 2);
+        } else {
+          this.hud.addSystem(`${ev.who} started up the ladder.`);
+        }
+        break;
+      case 'vent':
+        if (ev.id === this.localId) {
+          this.hud.setFade(true, 'YOU ARE OUT', 'The grille closes behind you');
+          this.audio.stopLoop('backrooms');
+          this.audio.startFinalMusic();
+        } else {
+          this.hud.addSystem(`${ev.who} got into the vent.`);
+        }
+        break;
+
+      // --- The rifle -----------------------------------------------------------
+      case 'gun-taken':
+        this.hud.addSystem(`${ev.by} picked up the rifle.`);
+        if (ev.id === this.localId) this.hud.banner('AK-47', '', 2.4);
+        break;
+      case 'gun-dropped':
+        this.hud.addSystem('The rifle hit the floor.');
+        break;
+      case 'gun-reload':
+        if (ev.id === this.localId) this.viewWeapon.reload();
+        this.audio.gunReload(
+          ev.id === this.localId ? this.player.position.x : 0,
+          ev.id === this.localId ? this.player.position.z : 0,
+          ev.seconds
+        );
+        break;
+      case 'gun-reloaded':
+        if (ev.id === this.localId) this.ammo = { mag: ev.mag, reserve: ev.reserve, reloading: 0 };
+        break;
+      case 'dry':
+        if (ev.id !== this.localId) this.audio.dryFire(this.player.position.x, this.player.position.z);
+        break;
+      case 'shot':
+        // Somebody else firing. The muzzle flash, the recoil and the report all
+        // come from here, so a teammate shooting is unmistakable across a room.
+        if (ev.id !== this.localId) {
+          this.entities.remoteFire(ev.id);
+          this.audio.gunshot(ev.x, ev.z, false);
+        }
+        this.impact(ev);
+        break;
+      case 'monster-hit':
+        this.audio.fleshHit(ev.x, ev.z);
+        break;
+      case 'monster-down':
+        this.audio.scream(ev.x, ev.z);
+        this.hud.banner('IT WENT DOWN', 'good', 3.4);
+        this.hud.addSystem(`${ev.by} put it down. It is not dead.`);
+        break;
+      case 'monster-rise':
+        this.audio.growl(ev.x, ev.z, 1.6);
+        this.hud.banner('IT IS UP AGAIN', 'bad', 4);
+        this.hud.addSystem('It got back up. It is faster now.');
+        break;
+      case 'friendly':
+        if (ev.id === this.localId) {
+          this.fx.hitFlash(0.6, 0.9);
+          this.player.kick(2);
+          this.hud.banner(`${ev.by.toUpperCase()} IS SHOOTING YOU`, 'bad', 3);
+        } else {
+          this.hud.addSystem(`${ev.by} shot ${ev.who}.`);
         }
         break;
       case 'sabotage':
@@ -541,10 +865,7 @@ class Game {
       case 'death':
         this.hud.addSystem(`${ev.who} did not make it.`);
         break;
-      case 'escape':
-        this.hud.addSystem(`${ev.who} reached the surface.`);
-        if (ev.id !== this.localId) this.hud.banner(`${ev.who.toUpperCase()} IS OUT`, 'good', 2.4);
-        break;
+
       case 'pickup':
         if (ev.by) this.hud.addSystem(`${ev.by} picked up a fuse.`);
         if (ev.id === this.localId && ev.recharged) {
@@ -563,6 +884,16 @@ class Game {
     }
   }
 
+  // Where a round ended up, drawn once. A puff of dust off concrete, or a
+  // brief red mark on something that bleeds.
+  impact(ev) {
+    const x = ev.x + ev.dx * ev.d;
+    const y = ev.y + ev.dy * ev.d;
+    const z = ev.z + ev.dz * ev.d;
+    if (ev.h === 0) this.audio.ricochet(x, z);
+    this.entities.impact(x, y, z, ev.h);
+  }
+
   // --- Frame ----------------------------------------------------------------
 
   frame() {
@@ -573,7 +904,11 @@ class Game {
     if (this.phase === 'playing') this.updatePlaying(dt);
     else if (this.phase === 'ended') this.updateEnded(dt);
 
+    this.renderer.info.reset();
+    this.renderer.clear();
     this.renderer.render(this.scene, this.camera);
+    // The rifle, over a cleared depth buffer: no wall can reach into it.
+    this.viewWeapon.render(this.renderer);
   }
 
 // Scale the render resolution to hit the frame budget.
@@ -610,20 +945,35 @@ class Game {
     this.endCountdown -= dt;
     this.hud.setEndCountdown(Math.ceil(this.endCountdown));
     // Keep the world drifting behind the results card rather than freezing.
-    this.entities.update(dt, this.localId, this.camera.position);
-    this.world.update(dt, this.camera.position, this.powered, this.exitOpen,
+    this.entities.update(dt, this.localId, this.camera.position, this.zone);
+    if (this.zone === 1) this.backrooms.update(dt, this.camera.position);
+    else this.world.update(dt, this.camera.position, this.powered, this.door,
       this.generatorOn, this.fire, this.camera);
   }
 
   updatePlaying(dt) {
-    const frozen = this.hud.chatOpen || !!this.hud.current;
-    this.player.update(dt, this.input, this.world, { frozen });
+    const frozen = this.hud.chatOpen || !!this.hud.current || this.transitioning;
+    // On the ladder the server owns your feet; all you keep is where you look.
+    if (this.climb > 0) this.updateClimb(dt);
+    else this.player.update(dt, this.input, this.activeWorld(), { frozen });
 
     if (this.player.state === PLAYER_STATE.DEAD) this.spectate(dt);
 
-    this.entities.update(dt, this.localId, this.camera.position);
-    this.world.update(dt, this.player.position, this.powered, this.exitOpen,
-      this.generatorOn, this.fire, this.camera);
+    this.entities.update(dt, this.localId, this.camera.position, this.zone);
+    if (this.zone === 1) {
+      this.backrooms.update(dt, this.player.position);
+      this.audio.updateBackrooms(dt);
+    } else {
+      this.world.update(dt, this.player.position, this.powered, this.door,
+        this.generatorOn, this.fire, this.camera);
+    }
+
+    this.viewWeapon.update(dt, {
+      moveSpeed: this.player.planarSpeed || 0,
+      lookDelta: this.input.lastLook || { x: 0, y: 0 },
+      crouched: this.player.crouching,
+    });
+    this.updateShooting(dt);
 
     const threat = this.entities.nearestMonster(this.player.position);
     this.updateFear(dt, threat);
@@ -643,7 +993,7 @@ class Game {
   // Dead players ride along with whoever is still breathing.
   spectate(dt) {
     const alive = [...this.entities.players.entries()]
-      .filter(([, e]) => e.data.state === PLAYER_STATE.ALIVE);
+      .filter(([, e]) => e.data.state === PLAYER_STATE.ALIVE && (e.data.zone ?? 0) === this.zone);
     if (!alive.length) return;
     if (!this.spectating || !alive.some(([id]) => id === this.spectating)) {
       this.spectating = alive[0][0];
@@ -655,7 +1005,11 @@ class Game {
   }
 
   updateFear(dt, threat) {
-    const litNearby = this.exitOpen || this.powered > 0;
+    // Nothing hunts you in the Backrooms, so none of the dread machinery runs
+    // there. The place has to be unsettling on its own merits.
+    if (this.zone === 1) return this.updateBackroomsMood(dt);
+
+    const litNearby = this.generatorOn || this.powered > 0;
     let allyNear = false;
     for (const e of this.entities.players.values()) {
       if (e.data.state !== PLAYER_STATE.ALIVE) continue;
@@ -665,7 +1019,7 @@ class Game {
       monsterDistance: threat.distance,
       monsterChasing: threat.state === MONSTER_STATE.CHASE,
       allyNear,
-      lit: litNearby && this.exitOpen,
+      lit: litNearby && this.generatorOn,
     });
     this.fx.update(dt, this.player.nerve);
 
@@ -694,13 +1048,26 @@ class Game {
     this.audio.fireBed(this.fire);
   }
 
+  // The Backrooms have their own weather: no fog to speak of, flat warm light
+  // and nothing chasing anybody. The unease is supposed to come from the room.
+  updateBackroomsMood(dt) {
+    this.ambient.intensity += (AMBIENT_BACKROOMS - this.ambient.intensity) * Math.min(1, dt * 1.2);
+    this.scene.fog.density += (0.024 - this.scene.fog.density) * Math.min(1, dt * 0.8);
+    this.player.updateNerve(dt, {
+      monsterDistance: Infinity, monsterChasing: false, allyNear: true, lit: true,
+    });
+    this.fx.update(dt, this.player.nerve * 0.35);
+  }
+
   // --- Interaction ----------------------------------------------------------
 
   updateInteraction(dt) {
     this.hold.cooldown = Math.max(0, this.hold.cooldown - dt);
 
-    if (this.player.state !== PLAYER_STATE.ALIVE || this.hud.chatOpen || this.hud.current) {
+    if (this.player.state !== PLAYER_STATE.ALIVE || this.hud.chatOpen || this.hud.current
+      || this.climb > 0 || this.transitioning) {
       this.cancelHold();
+      this.hud.hidePrompt();
       return;
     }
 
@@ -731,7 +1098,8 @@ class Game {
       const needed = HOLD_TIME[target.kind];
       if (this.hold.time >= needed) {
         this.net.use(target.kind, target.id);
-        if (target.kind === 'fuse' || target.kind === 'battery' || target.kind === 'gas') this.audio.pickup();
+        if (target.kind === 'fuse' || target.kind === 'battery' || target.kind === 'gas'
+          || target.kind === 'weapon') this.audio.pickup();
         this.hold.cooldown = 0.7;
         this.cancelHold();
         this.hud.hidePrompt();
@@ -762,9 +1130,20 @@ class Game {
       const g = this.map.generator;
       candidates.push({ kind: 'insert', id: 0, x: g.x, z: g.z, label: 'Seat the fuse' });
     }
-    if (this.exitOpen && this.map) {
-      const e = this.map.exit;
-      candidates.push({ kind: 'exit', id: 0, x: e.x, z: e.z, label: 'Escape through the emergency door' });
+    // The door's button. It only ever exists on the panel, never on the door.
+    if (this.map && this.map.door && this.zone === 0) {
+      const panel = this.map.door.panel;
+      if (this.door[0] === 0) {
+        candidates.push({
+          kind: 'button', id: 0, x: panel.x, z: panel.z,
+          label: this.generatorOn ? 'Press the door button' : 'Press it anyway',
+        });
+      }
+    }
+    // The ladder at the end of the corridor. No marker leads to it.
+    if (this.zone === 1 && this.back && this.climb <= 0) {
+      const l = this.back.ladder;
+      candidates.push({ kind: 'ladder', id: 0, x: l.x, z: l.z, label: 'Climb' });
     }
     // Once every fuse is seated the generator becomes a switch for the whole
     // building, and it can be thrown either way.
@@ -778,16 +1157,21 @@ class Game {
     for (const item of this.entities.interactables()) {
       if (item.kind === 'battery') candidates.push({ ...item, label: 'Take the battery' });
       if (item.kind === 'gas') candidates.push({ ...item, label: 'Take the gasoline' });
+      if (item.kind === 'weapon') candidates.push({ ...item, label: 'Take the rifle' });
     }
     // Carrying the can turns the generator into a second, very different option.
     if (this.carryingGas && this.map && !this.sabotage) {
       const g = this.map.generator;
       candidates.push({ kind: 'pour', id: 0, x: g.x, z: g.z, label: 'Pour the gasoline in' });
     }
-    // A dead door still tells you why it will not open.
-    if (this.map && !this.exitOpen) {
-      const e = this.map.exit;
-      candidates.push({ kind: 'locked', id: 0, x: e.x, z: e.z, label: 'Emergency door has no power' });
+    // The door itself is never the interaction. Standing at it while it is shut
+    // just tells you where the button is.
+    if (this.map && this.map.door && this.zone === 0 && this.door[0] !== 2) {
+      const d = this.map.door;
+      candidates.push({
+        kind: 'locked', id: 0, x: d.x, z: d.z,
+        label: this.door[0] === 1 ? 'The shutter is coming up' : 'Bulkhead - control panel to the side',
+      });
     }
     if (!this.carrying && !this.carryingGas) {
       for (const item of this.entities.interactables()) {
@@ -889,13 +1273,23 @@ class Game {
     this.hud.setMeters(this.player.stamina, this.player.charge);
     this.hud.setReserve(this.player.reserve);
     this.hud.setCarrying(this.carryingGas ? 'gas' : this.carrying ? 'fuse' : null);
-    this.hud.setFusePips(this.powered, this.need);
+    // Fuses are a facility problem. On the other side of the door there is no
+    // counter, no marker and nothing to track.
+    this.hud.setFusePips(this.zone === 1 ? 0 : this.powered, this.zone === 1 ? 0 : this.need);
     this.hud.setPing(this.net.ping);
 
     if (this.player.state === PLAYER_STATE.DOWN) this.hud.setDowned(true, this.downTimer);
 
-    if (this.exitOpen) {
-      this.hud.setObjective('RUN. The exit is open.', true);
+    this.hud.setAmmo(this.armed, this.ammo.mag, this.ammo.reserve, this.ammo.reloading);
+
+    if (this.zone === 1) {
+      this.hud.setObjective('Find the way out', false);
+    } else if (this.door[0] === 2) {
+      this.hud.setObjective('The bulkhead is open', true);
+    } else if (this.door[0] === 1) {
+      this.hud.setObjective('The shutter is winding up', true);
+    } else if (this.generatorOn) {
+      this.hud.setObjective('The door panel has power');
     } else if (this.powered >= this.need) {
       this.hud.setObjective(this.generatorOn ? 'The building is lit' : 'Start the generator');
     } else if (this.carrying) {

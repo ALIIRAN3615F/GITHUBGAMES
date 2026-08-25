@@ -15,6 +15,10 @@
 <!-- Film grain, vignette and damage overlays sit above the WebGL canvas -->
 <div id="grain" aria-hidden="true"></div>
 <div id="vignette" aria-hidden="true"></div>
+<div id="fade" aria-hidden="true">
+  <div id="fadeNote"></div>
+  <div id="fadeSub"></div>
+</div>
 <div id="flash" aria-hidden="true"></div>
 <div id="scanline" aria-hidden="true"></div>
 
@@ -46,6 +50,11 @@
       <div id="reserveRow"><span class="cell-icon"></span>BATTERIES <b id="reserveVal">0</b></div>
     </div>
     <div id="carrying" hidden><span class="carry-icon"></span> CARRYING FUSE</div>
+    <div id="ammo" hidden>
+      <span class="ammo-name">AK-47</span>
+      <b id="ammoMag">30</b><span class="ammo-sep">/</span><span id="ammoReserve">30</span>
+      <span id="ammoState"></span>
+    </div>
   </div>
 
   <div class="hud-corner hud-br">
@@ -156,6 +165,7 @@
     <div class="panel end-panel">
       <div id="endSummary" class="end-summary"></div>
       <table id="endTable" class="end-table"></table>
+      <div id="endCredits" class="end-credits" hidden></div>
       <div class="end-countdown">Returning to staging in <span id="endCountdown">14</span>s</div>
     </div>
   </section>
