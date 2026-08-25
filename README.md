@@ -1,3 +1,18 @@
+# GITHUBGAMES
+
+Two co-op LAN horror games. Same facility, same premise, two dimensions apart.
+
+| | |
+|---|---|
+| **[SIGNAL LOST](#signal-lost)** | First person, three dimensional, three.js. `npm start` on port 8080. |
+| **[DEAD AIR](dead-air/README.md)** | Top down, two dimensional, canvas with real shadow casting. `cd dead-air && npm start` on port 8090. |
+
+Both are zero-dependency: one Node process serves the client and hosts the
+session, there is nothing to install, and every texture and sound is generated
+at runtime. They can run side by side on the same machine.
+
+---
+
 # SIGNAL LOST
 
 A co-op **LAN horror game** that runs in the browser. HTML5 + WebGL via three.js on the

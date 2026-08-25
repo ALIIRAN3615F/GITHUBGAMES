@@ -249,16 +249,20 @@ class Session {
     const budget = SPEED.sprint * 1.6 * dt + 0.6;
     const dx = nx - player.x, dz = nz - player.z;
     const moved = Math.hypot(dx, dz);
+
+    // Anything past the budget is pulled back to it rather than rejected, so a
+    // laggy client still moves. What it must not do is skip the geometry check
+    // on the way: a clamped move is still a move, and a body sliding several
+    // metres toward a far-off point would otherwise slide through a wall.
+    let tx = nx, tz = nz;
     if (moved > budget) {
       const s = budget / moved;
-      player.x += dx * s;
-      player.z += dz * s;
-    } else if (this.isSolidAt(nx, nz, player.zone) || this.crossesSolid(player, nx, nz)) {
-      // Inside geometry, or a step that would pass through it on the way -
-      // ignore, and keep the last legal position.
-    } else {
-      player.x = nx;
-      player.z = nz;
+      tx = player.x + dx * s;
+      tz = player.z + dz * s;
+    }
+    if (!this.isSolidAt(tx, tz, player.zone) && !this.crossesSolid(player, tx, tz)) {
+      player.x = tx;
+      player.z = tz;
     }
     // A player who has walked through the doorway must not still be standing in
     // the facility as far as the server is concerned.

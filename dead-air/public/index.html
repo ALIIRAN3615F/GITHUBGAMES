@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>DEAD AIR</title>
+<link rel="stylesheet" href="css/style.css" />
+<link rel="icon" href="data:," />
+</head>
+<body>
+
+<canvas id="scene"></canvas>
+<div id="flash" aria-hidden="true"></div>
+
+<!-- ===================== In-game HUD ===================== -->
+<div id="hud" hidden>
+  <div class="corner tl">
+    <div id="objective">
+      <div class="obj-title">OBJECTIVE</div>
+      <div class="obj-text" id="objText">Find a fuse in the dark</div>
+      <div class="pips" id="fusePips"></div>
+    </div>
+  </div>
+
+  <div class="corner tr">
+    <div id="roster"></div>
+    <div id="netstat"><span id="pingVal">--</span> ms</div>
+  </div>
+
+  <div class="corner bl">
+    <div class="meter">
+      <div class="meter-label">STAMINA</div>
+      <div class="track"><div class="fill stamina" id="staminaFill"></div></div>
+    </div>
+    <div class="meter">
+      <div class="meter-label">FLASHLIGHT <span id="chargeVal">100%</span></div>
+      <div class="track"><div class="fill battery" id="batteryFill"></div></div>
+      <div id="reserveRow">BATTERIES <b id="reserveVal">0</b></div>
+    </div>
+    <div id="carrying" hidden>CARRYING A FUSE</div>
+  </div>
+
+  <div class="corner br"><div id="chatLog"></div></div>
+
+  <div id="prompt" hidden>
+    <div class="prompt-key" id="promptKey">E</div>
+    <div class="prompt-text" id="promptText">Interact</div>
+    <div class="prompt-progress"><div id="promptFill"></div></div>
+  </div>
+
+  <div id="banner" hidden></div>
+  <div id="downed" hidden>
+    <div class="big">YOU ARE DOWN</div>
+    <div class="sub">Bleeding out in <span id="downTimer">45</span>s</div>
+    <div class="hint">A teammate has to reach you and hold <b>E</b></div>
+  </div>
+  <div id="dead" hidden>
+    <div class="big">YOU DIED</div>
+    <div class="sub">Watching the others...</div>
+  </div>
+
+  <form id="chatForm" hidden><input id="chatInput" maxlength="180" autocomplete="off" placeholder="Say something..." /></form>
+  <div id="scoreboard" hidden></div>
+</div>
+
+<!-- ===================== Screens ===================== -->
+<div id="screens">
+  <section id="screenTitle" class="screen active">
+    <h1 class="logo">DEAD AIR</h1>
+    <p class="tagline">The power is out. Something down here is listening.</p>
+    <div class="panel">
+      <label class="field">
+        <span>YOUR NAME</span>
+        <input id="nameInput" maxlength="16" placeholder="Survivor" autocomplete="off" />
+      </label>
+      <button id="joinBtn" class="btn primary">JOIN THE FACILITY</button>
+      <div id="joinError" class="error"></div>
+      <p class="hint">Everyone on this network opens the same address. First one in runs the lobby.</p>
+    </div>
+  </section>
+
+  <section id="screenLobby" class="screen">
+    <h2 class="heading">STAGING</h2>
+    <div class="panel">
+      <ul id="lobbyPlayers"></ul>
+      <div class="settings" id="hostSettings">
+        <div class="setting">
+          <span>FACILITY SIZE</span>
+          <div class="choices" id="sizeChoices"></div>
+        </div>
+        <div class="setting">
+          <span>FUSES <b id="fuseVal">5</b></span>
+          <input type="range" id="setFuses" min="3" max="9" value="5" />
+        </div>
+        <div class="setting">
+          <span>DIFFICULTY</span>
+          <div class="choices" id="diffChoices"></div>
+        </div>
+      </div>
+      <div class="row">
+        <button id="readyBtn" class="btn">READY</button>
+        <button id="startBtn" class="btn primary" disabled>START THE RUN</button>
+      </div>
+      <button id="leaveLobbyBtn" class="btn ghost">LEAVE</button>
+    </div>
+  </section>
+
+  <section id="screenPause" class="screen">
+    <h2 class="heading">PAUSED</h2>
+    <div class="panel">
+      <div class="setting">
+        <span>VOLUME <b id="volVal">80</b></span>
+        <input type="range" id="setVol" min="0" max="100" value="80" />
+      </div>
+      <div class="setting">
+        <span>ZOOM <b id="zoomVal">1.0</b></span>
+        <input type="range" id="setZoom" min="60" max="150" value="100" />
+      </div>
+      <div class="keys">
+        <div><b>WASD</b> move</div><div><b>Mouse</b> aim your light</div>
+        <div><b>Shift</b> sprint (loud)</div><div><b>C</b> crouch (quiet)</div>
+        <div><b>F</b> flashlight</div><div><b>E</b> hold to interact</div>
+        <div><b>R</b> load a battery</div><div><b>Q</b> drop the fuse</div>
+        <div><b>T</b> chat</div><div><b>Tab</b> scoreboard</div>
+      </div>
+      <button id="resumeBtn" class="btn primary">RESUME</button>
+      <button id="leaveBtn" class="btn ghost">LEAVE THE FACILITY</button>
+    </div>
+  </section>
+
+  <section id="screenEnd" class="screen">
+    <h2 class="heading" id="endTitle">EXTRACTED</h2>
+    <div class="panel">
+      <div id="endSummary"></div>
+      <table id="endTable"></table>
+      <div class="countdown">Back to staging in <span id="endCountdown">14</span>s</div>
+    </div>
+  </section>
+
+  <div id="loading" hidden><div class="spinner"></div><div id="loadingText">DESCENDING...</div></div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
