@@ -1,0 +1,4 @@
+{
+  "//": "Marks this directory as ES modules for Node, so the test suite can import the client code directly. The browser ignores this file; it only matters to Node's module resolution.",
+  "type": "module"
+}

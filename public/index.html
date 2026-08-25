@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>SIGNAL LOST</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23090b0e'/%3E%3Ccircle cx='16' cy='14' r='7' fill='none' stroke='%23c8452f' stroke-width='2'/%3E%3Ccircle cx='16' cy='14' r='2' fill='%23c8452f'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<canvas id="scene"></canvas>
+
+<!-- Film grain, vignette and damage overlays sit above the WebGL canvas -->
+<div id="grain" aria-hidden="true"></div>
+<div id="vignette" aria-hidden="true"></div>
+<div id="fade" aria-hidden="true">
+  <div id="fadeNote"></div>
+  <div id="fadeSub"></div>
+</div>
+<div id="flash" aria-hidden="true"></div>
+<div id="scanline" aria-hidden="true"></div>
+
+<!-- ===================== In-game HUD ===================== -->
+<div id="hud" hidden>
+  <div id="crosshair"></div>
+
+  <div class="hud-corner hud-tl">
+    <div id="objective">
+      <div class="obj-title">OBJECTIVE</div>
+      <div class="obj-text" id="objText">Find the fuses</div>
+      <div class="fuse-pips" id="fusePips"></div>
+    </div>
+  </div>
+
+  <div class="hud-corner hud-tr">
+    <div id="roster"></div>
+    <div id="netstat"><span id="pingVal">--</span> ms</div>
+  </div>
+
+  <div class="hud-corner hud-bl">
+    <div class="meter" id="staminaMeter">
+      <div class="meter-label">STAMINA</div>
+      <div class="meter-track"><div class="meter-fill stamina" id="staminaFill"></div></div>
+    </div>
+    <div class="meter" id="batteryMeter">
+      <div class="meter-label">FLASHLIGHT <span id="chargeVal">100%</span></div>
+      <div class="meter-track"><div class="meter-fill battery" id="batteryFill"></div></div>
+      <div id="reserveRow"><span class="cell-icon"></span>BATTERIES <b id="reserveVal">0</b></div>
+    </div>
+    <div id="carrying" hidden><span class="carry-icon"></span> CARRYING FUSE</div>
+    <div id="ammo" hidden>
+      <span class="ammo-name">AK-47</span>
+      <b id="ammoMag">30</b><span class="ammo-sep">/</span><span id="ammoReserve">30</span>
+      <span id="ammoState"></span>
+    </div>
+  </div>
+
+  <div class="hud-corner hud-br">
+    <div id="chatLog"></div>
+  </div>
+
+  <div id="prompt" hidden>
+    <div class="prompt-key" id="promptKey">E</div>
+    <div class="prompt-text" id="promptText">Interact</div>
+    <div class="prompt-progress"><div id="promptFill"></div></div>
+  </div>
+
+  <div id="statusBanner" hidden></div>
+  <div id="downedOverlay" hidden>
+    <div class="downed-title">YOU ARE DOWN</div>
+    <div class="downed-sub">Bleeding out in <span id="downTimer">45</span>s</div>
+    <div class="downed-hint">A teammate must reach you and hold <b>E</b></div>
+  </div>
+  <div id="deadOverlay" hidden>
+    <div class="dead-title">YOU DIED</div>
+    <div class="dead-sub">Watching the others...</div>
+  </div>
+
+  <div id="chatInputWrap" hidden>
+    <span class="chat-prefix">RADIO</span>
+    <input id="chatInput" maxlength="180" autocomplete="off" spellcheck="false" />
+  </div>
+
+  <div id="scoreboard" hidden></div>
+</div>
+
+<!-- ===================== Menus ===================== -->
+<div id="screens">
+
+  <!-- Title / connect -->
+  <section id="screenTitle" class="screen active">
+    <div class="title-block">
+      <h1 class="game-title">SIGNAL<span>LOST</span></h1>
+      <p class="tagline">Six fuses. One generator. Something else down here with you.</p>
+    </div>
+
+    <div class="panel">
+      <label class="field">
+        <span>YOUR NAME</span>
+        <input id="nameInput" maxlength="16" placeholder="Survivor" autocomplete="off" spellcheck="false" />
+      </label>
+      <button id="joinBtn" class="btn primary">ENTER THE FACILITY</button>
+      <div id="connError" class="error" hidden></div>
+      <div class="lan-hint">
+        Others on this network join at
+        <code id="lanUrl">-</code>
+      </div>
+    </div>
+
+    <div class="controls-hint">
+      <div><b>WASD</b> move</div><div><b>SHIFT</b> sprint</div><div><b>C</b> crouch / hide</div><div><b>CTRL</b> hold to crouch</div>
+      <div><b>F</b> flashlight</div><div><b>E</b> interact</div><div><b>R</b> reload light</div><div><b>T</b> radio</div>
+      <div><b>TAB</b> scores</div><div><b>ESC</b> menu</div>
+    </div>
+  </section>
+
+  <!-- Lobby -->
+  <section id="screenLobby" class="screen">
+    <h2 class="screen-heading">STAGING AREA</h2>
+    <div class="lobby-grid">
+      <div class="panel">
+        <div class="panel-heading">SURVIVORS <span id="lobbyCount">0/8</span></div>
+        <ul id="lobbyPlayers" class="player-list"></ul>
+      </div>
+      <div class="panel">
+        <div class="panel-heading">EXPEDITION</div>
+        <div class="setting">
+          <span>DIFFICULTY</span>
+          <div class="seg" id="setDifficulty">
+            <button data-v="calm">Calm</button>
+            <button data-v="normal" class="on">Normal</button>
+            <button data-v="nightmare">Nightmare</button>
+          </div>
+        </div>
+        <div class="setting">
+          <span>FACILITY SIZE</span>
+          <div class="seg" id="setSize">
+            <button data-v="small">Small</button>
+            <button data-v="medium" class="on">Medium</button>
+            <button data-v="large">Large</button>
+          </div>
+        </div>
+        <div class="setting">
+          <span>FUSES <b id="fuseVal">6</b></span>
+          <input type="range" id="setFuses" min="3" max="9" value="6" />
+        </div>
+        <div class="host-note" id="hostNote">Only the host can change these.</div>
+        <button id="startBtn" class="btn primary" disabled>START THE RUN</button>
+        <button id="readyBtn" class="btn">READY UP</button>
+      </div>
+    </div>
+    <div class="brief">
+      <b>How it works.</b> Fuses are scattered through the dark. You can carry one at a time.
+      Feed them all into the generator, then run for the exit. The thing down here hunts by sound
+      and by light &mdash; sprinting is loud, your flashlight is a beacon, crouching is quiet.
+      If it catches you, you go down; a teammate has to reach you before you bleed out.
+    </div>
+  </section>
+
+  <!-- Round results -->
+  <section id="screenEnd" class="screen">
+    <h2 class="screen-heading" id="endTitle">EXTRACTED</h2>
+    <div class="panel end-panel">
+      <div id="endSummary" class="end-summary"></div>
+      <table id="endTable" class="end-table"></table>
+      <div id="endCredits" class="end-credits" hidden></div>
+      <div class="end-countdown">Returning to staging in <span id="endCountdown">14</span>s</div>
+    </div>
+  </section>
+
+  <!-- Pause / settings -->
+  <section id="screenPause" class="screen">
+    <h2 class="screen-heading">PAUSED</h2>
+    <div class="panel">
+      <div class="setting">
+        <span>LOOK SENSITIVITY <b id="sensVal">1.0</b></span>
+        <input type="range" id="setSens" min="20" max="300" value="100" />
+      </div>
+      <div class="setting">
+        <span>VOLUME <b id="volVal">80</b></span>
+        <input type="range" id="setVol" min="0" max="100" value="80" />
+      </div>
+      <div class="setting">
+        <span>FIELD OF VIEW <b id="fovVal">75</b></span>
+        <input type="range" id="setFov" min="60" max="100" value="75" />
+      </div>
+      <div class="setting">
+        <span>GRAPHICS</span>
+        <div class="seg" id="setQuality">
+          <button data-v="low">Low</button>
+          <button data-v="medium" class="on">Medium</button>
+          <button data-v="high">High</button>
+        </div>
+      </div>
+      <button id="resumeBtn" class="btn primary">RESUME</button>
+      <button id="leaveBtn" class="btn danger">LEAVE THE RUN</button>
+    </div>
+  </section>
+
+  <!-- Pointer lock prompt shown between deaths / after Esc -->
+  <section id="screenClick" class="screen click-catch">
+    <div class="click-inner">
+      <div class="click-title">CLICK TO LOOK</div>
+      <div class="click-sub">Your mouse controls your head</div>
+    </div>
+  </section>
+</div>
+
+<div id="loading" hidden><div class="loading-inner"><div class="loading-bar"><i></i></div><div id="loadingText">DESCENDING...</div></div></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

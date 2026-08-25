@@ -1,0 +1,15 @@
+{
+  "name": "dead-air",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A top-down co-op LAN horror game. No dependencies, no assets, no build step.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,26 @@
+{
+  "name": "signal-lost",
+  "version": "1.0.0",
+  "description": "SIGNAL LOST - a co-op LAN horror game built with HTML5 + three.js. Zero dependencies.",
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js --port 8080",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "horror",
+    "game",
+    "three.js",
+    "webgl",
+    "lan",
+    "multiplayer",
+    "co-op",
+    "html5"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  }
+}
