@@ -732,6 +732,10 @@ class Session {
     // Spread arrivals so two people never land inside each other.
     const spread = ((player.id % 4) - 1.5) * 1.1;
     player.zone = Z_BACKROOMS;
+    // There is nothing to see by in here that is not already lit. Putting the
+    // flashlight out on the way through means nobody burns the last of a
+    // battery on a corridor that is brighter than the beam.
+    player.flags &= ~F_LIGHT;
     player.x = entry.x;
     player.z = entry.z + spread;
     player.y = 0;
@@ -1078,6 +1082,7 @@ class Session {
     for (const p of this.players.values()) {
       if (!(p.flags & F_LIGHT)) continue;
       if (p.state !== ST_ALIVE) continue;
+      if (p.zone !== Z_FACILITY) continue;      // nothing here needs a torch
       if (p.charge <= 0) continue;
       p.charge = Math.max(0, p.charge - FLASHLIGHT_DRAIN * dt);
       if (p.charge === 0) {

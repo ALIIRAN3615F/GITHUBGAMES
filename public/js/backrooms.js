@@ -147,7 +147,8 @@ export class Backrooms {
     spots.forEach((s, i) => {
       m.compose(new THREE.Vector3(s.x, wallH - 0.03, s.z), q, scale);
       mesh.setMatrixAt(i, m);
-      colour.setScalar(s.dead ? 0.12 : 1);
+      // A dead tube is an unlit diffuser, not a hole in the ceiling.
+      colour.setScalar(s.dead ? 0.45 : 1);
       mesh.setColorAt(i, colour);
     });
     mesh.instanceMatrix.needsUpdate = true;

@@ -562,6 +562,9 @@ class Game {
       this.player.teleport(row[1], row[3]);
       this.player.yaw = row[4];
       this.player.pitch = 0;
+      // The place is lit. A flashlight here only blows out the wall in front
+      // of you, and the server has already put it out.
+      this.player.flashlightOn = false;
       this.scene.fog.density = 0.024;
       this.scene.fog.color.setHex(0xbda86a);
       this.scene.background = new THREE.Color(0xbda86a);
